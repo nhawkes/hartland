@@ -1,0 +1,23 @@
+# Coarse build axes, set through configuration modifiers.
+# Architecture and OS use prelude//cpu and prelude//os.
+
+constraint_setting(name = "libc", visibility = ["PUBLIC"])
+
+constraint_value(name = "musl", constraint_setting = ":libc", visibility = ["PUBLIC"])
+
+constraint_value(name = "glibc", constraint_setting = ":libc", visibility = ["PUBLIC"])
+
+# Bootstrap stage: stage0 is the Zig seed, stage2 is the self-hosted toolchain.
+constraint_setting(name = "stage", visibility = ["PUBLIC"])
+
+constraint_value(name = "stage0", constraint_setting = ":stage", visibility = ["PUBLIC"])
+
+constraint_value(name = "stage1", constraint_setting = ":stage", visibility = ["PUBLIC"])
+
+constraint_value(name = "stage2", constraint_setting = ":stage", visibility = ["PUBLIC"])
+
+constraint_setting(name = "opt", visibility = ["PUBLIC"])
+
+constraint_value(name = "debug", constraint_setting = ":opt", visibility = ["PUBLIC"])
+
+constraint_value(name = "release", constraint_setting = ":opt", visibility = ["PUBLIC"])
