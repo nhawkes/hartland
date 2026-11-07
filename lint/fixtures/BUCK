@@ -1,0 +1,43 @@
+load(":defs.bzl", "props_rule")
+
+# Deliberately bad targets: the lint must reject every one of these.
+# Excluded from the default lint scope; exercised by lint/test.sh.
+
+http_archive(
+    name = "no-sha256",
+    urls = ["https://example.invalid/a.tar.gz"],
+    sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+)
+
+http_file(
+    name = "sha1-and-sha256",
+    urls = ["https://example.invalid/b"],
+    sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+    sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+)
+
+genrule(
+    name = "fetches",
+    out = "x",
+    cmd = "curl -fsSL https://example.invalid > $OUT",
+)
+
+genrule(
+    name = "clones",
+    out = "y",
+    bash = select({
+        "DEFAULT": "git clone https://example.invalid/r $OUT",
+    }),
+)
+
+props_rule(
+    name = "net-prop",
+    exec_properties = {"dockerNetwork": "bridge"},
+)
+
+# Must NOT be flagged: "git" only as part of a longer word / path.
+genrule(
+    name = "ok-gitignore",
+    out = "w",
+    cmd = "cp $SRCDIR/.gitignore-like $OUT || touch $OUT",
+)

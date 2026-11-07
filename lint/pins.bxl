@@ -1,0 +1,103 @@
+"""Hermeticity lint for Hartland package repositories.
+
+    buck2 bxl hartland//lint/pins.bxl:lint
+    buck2 bxl hartland//lint/pins.bxl:lint -- --pattern 'root//foo/...'
+
+Fails (non-zero exit) when any target:
+  * downloads (http_archive / http_file / remote_file) without a sha256, or with a sha1;
+  * runs a genrule whose command calls a network fetcher (curl, wget, git, ...);
+  * sets a network-related execution property in its attributes. The only
+    blessed source of exec properties is hartland's execution platform rule,
+    which pins network off in code rather than in attributes.
+"""
+
+_DOWNLOAD_RULES = ["http_archive", "http_file", "remote_file"]
+_GENRULE_CMD_ATTRS = ["cmd", "bash", "cmd_exe"]
+_FETCHERS = ["curl", "wget", "git", "fetch", "aria2c", "rsync", "scp", "ssh", "nc", "pip", "npm"]
+_NETWORK_KEYS = ["dockerNetwork", "network", "Network"]
+_WORD = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+
+def _rule_name(t):
+    return t.rule_type.split(":")[-1]
+
+def _text(v):
+    # Strings come back verbatim; selects and other coerced values via repr.
+    return v if type(v) == "string" else repr(v)
+
+def _words(s):
+    out = []
+    cur = ""
+    for c in s.elems():
+        if c in _WORD:
+            cur += c
+        else:
+            if cur:
+                out.append(cur)
+            cur = ""
+    if cur:
+        out.append(cur)
+    return out
+
+def _check_download(t, errs):
+    a = t.attrs
+    sha256 = getattr(a, "sha256", None)
+    if not sha256 or _text(sha256) in ["", "\"\"", "None"]:
+        errs.append("{}: {} without sha256".format(t.label, _rule_name(t)))
+    sha1 = getattr(a, "sha1", None)
+    if sha1 != None and _text(sha1) not in ["", "None"]:
+        errs.append("{}: sha1 pins are not allowed; use sha256".format(t.label))
+
+def _check_genrule(t, errs):
+    for name in _GENRULE_CMD_ATTRS:
+        v = getattr(t.attrs, name, None)
+        if v == None:
+            continue
+        hits = [w for w in _words(_text(v)) if w in _FETCHERS]
+        if hits:
+            errs.append("{}: genrule {} calls network fetcher(s): {}".format(
+                t.label,
+                name,
+                ", ".join(sorted({h: None for h in hits}.keys())),
+            ))
+
+def _check_network(t, errs):
+    a = t.attrs
+    for name in dir(a):
+        if name.startswith("buck."):
+            continue
+        s = _text(getattr(a, name))
+        for k in _NETWORK_KEYS:
+            if "\"{}\":".format(k) in s or "\"{}\" :".format(k) in s:
+                errs.append("{}: attribute {} sets exec property {}".format(t.label, name, k))
+
+def _impl(ctx):
+    patterns = ctx.cli_args.pattern or ["root//...", "toolchains//...", "hartland//..."]
+    query = "set({})".format(" ".join(patterns))
+    if not ctx.cli_args.pattern:
+        query += " - set(hartland//lint/fixtures/...)"
+    targets = ctx.uquery().eval(query)
+    errs = []
+    n = 0
+    for t in targets:
+        n += 1
+        r = _rule_name(t)
+        if r in _DOWNLOAD_RULES:
+            _check_download(t, errs)
+        if r == "genrule" or r.endswith("_genrule"):
+            _check_genrule(t, errs)
+        _check_network(t, errs)
+    if errs:
+        # ctx.output is dropped on failure, so the report goes in the failure itself.
+        fail("{} hermeticity violation(s) in {} targets:\n{}".format(
+            len(errs),
+            n,
+            "\n".join(["lint: " + e for e in errs]),
+        ))
+    ctx.output.print("lint: {} targets clean".format(n))
+
+lint = bxl_main(
+    impl = _impl,
+    cli_args = {
+        "pattern": cli_args.option(cli_args.list(cli_args.string())),
+    },
+)
