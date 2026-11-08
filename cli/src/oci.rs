@@ -27,23 +27,24 @@ impl Reply {
     }
 }
 
-/// GHCR allows 2000 requests per minute (seen as 429 TOOMANYREQUESTS); stay
-/// under it process-wide.
-const REQUESTS_PER_SECOND: f64 = 30.0;
-const ATTEMPTS: u32 = 6;
+const ATTEMPTS: u32 = 8;
 
-/// Spaces requests evenly: each caller takes the next slot and sleeps until it.
-async fn pace() {
-    static NEXT: std::sync::Mutex<Option<tokio::time::Instant>> = std::sync::Mutex::new(None);
-    let interval = std::time::Duration::from_secs_f64(1.0 / REQUESTS_PER_SECOND);
-    let slot = {
-        let mut next = NEXT.lock().unwrap_or_else(|p| p.into_inner());
-        let now = tokio::time::Instant::now();
-        let slot = next.map_or(now, |n| n.max(now));
-        *next = Some(slot + interval);
-        slot
-    };
-    tokio::time::sleep_until(slot).await;
+/// No pacing on our side: requests go as fast as callers send them. When the
+/// registry answers 429 it says how long to wait (GHCR: "retry-after: 17ms"
+/// in the body, allowed 2000/minute); the waiter sleeps exactly that while
+/// holding this gate, and every request passes the gate before sending, so
+/// nothing new goes out meanwhile and sleeps never overlap.
+static GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn wait_at_gate() {
+    drop(GATE.lock().await);
+}
+
+/// Sleeps out the rest of a 429's retry-after under the gate. Time already
+/// spent waiting for the gate counts, so concurrent 429s do not stack.
+async fn back_off(received: tokio::time::Instant, wait: std::time::Duration) {
+    let _held = GATE.lock().await;
+    tokio::time::sleep_until(received + wait).await;
 }
 
 fn retry_after(r: &Reply) -> Option<std::time::Duration> {
@@ -59,22 +60,29 @@ fn retry_after(r: &Reply) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs_f64(if unit.starts_with("ms") { n / 1000.0 } else { n }))
 }
 
-/// Sends with pacing, retrying 429/5xx (honouring retry-after) and transport
-/// errors with exponential backoff. `make` builds a fresh request each try.
+/// Sends, retrying 429 (sleeping what the registry asks, under the gate),
+/// 5xx and transport errors (exponential backoff). `make` builds a fresh
+/// request each try.
 async fn reply_with(make: impl Fn() -> reqwest::RequestBuilder) -> Result<Reply, String> {
     let mut last = String::new();
     for attempt in 0..ATTEMPTS {
-        pace().await;
-        let backoff = std::time::Duration::from_millis(250 << attempt);
+        wait_at_gate().await;
+        let backoff = std::time::Duration::from_millis(100 << attempt.min(6));
         match make().send().await {
             Ok(resp) => {
+                let received = tokio::time::Instant::now();
                 let status = resp.status().as_u16();
                 let headers = resp.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
                 let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
                 let r = Reply { status, body, headers };
-                if status == 429 || (500..600).contains(&status) {
+                if status == 429 {
+                    last = format!("429 {}", String::from_utf8_lossy(&r.body));
+                    back_off(received, retry_after(&r).unwrap_or(backoff)).await;
+                    continue;
+                }
+                if (500..600).contains(&status) {
                     last = format!("{status} {}", String::from_utf8_lossy(&r.body));
-                    tokio::time::sleep(retry_after(&r).unwrap_or(backoff).max(backoff)).await;
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
                 return Ok(r);
@@ -224,6 +232,25 @@ mod tests {
         let r = reply(vec![], r#"{"errors":[{"code":"TOOMANYREQUESTS","message":"retry-after: 17.763137ms, allowed: 2000/minute"}]}"#);
         let d = retry_after(&r).unwrap();
         assert!(d > std::time::Duration::from_millis(17) && d < std::time::Duration::from_millis(18));
+    }
+
+    #[tokio::test]
+    async fn concurrent_429s_do_not_stack_and_block_new_requests() {
+        let wait = std::time::Duration::from_millis(80);
+        let start = tokio::time::Instant::now();
+        // Two 429s received at the same moment, then a new request.
+        let a = tokio::spawn(back_off(start, wait));
+        let b = tokio::spawn(back_off(start, wait));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let c = tokio::spawn(async move {
+            wait_at_gate().await;
+            tokio::time::Instant::now()
+        });
+        let (_, _, sent) = (a.await.unwrap(), b.await.unwrap(), c.await.unwrap());
+        let total = start.elapsed();
+        assert!(total >= wait, "slept less than requested: {total:?}");
+        assert!(total < wait * 2, "sleeps stacked: {total:?}");
+        assert!(sent - start >= wait, "a new request went out during the back-off");
     }
 
     #[test]
