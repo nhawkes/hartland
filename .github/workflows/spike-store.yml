@@ -1,0 +1,46 @@
+# Spike: the proxy's registry store end to end on a hosted runner.
+#   write: a result goes through the proxy, which signs and publishes on SIGTERM
+#   read:  a fresh proxy finds it in GHCR, verifies it and serves it
+#   forge: a copied entry under another action tag is refused
+#   trust: a keyring that does not trust this workflow refuses it
+# Results go to spike/store-results.
+name: spike-store
+on:
+  push:
+    branches: [spike/ghcr]
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+jobs:
+  store:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      REGISTRY_USER: ${{ github.actor }}
+      REGISTRY_PASSWORD: ${{ github.token }}
+      REPO: nhawkes/hartland-spike-cache
+    steps:
+      - name: Fetch this commit
+        run: |
+          git init -q src && cd src
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Build
+        run: cd src/cli && cargo build --locked --release -q
+      - name: Store test
+        run: bash src/spikes/store/test.sh src/cli/target/release/hartland src/keys/github-actions-jwks.json results
+      - name: Publish results
+        if: always()
+        run: |
+          mkdir -p results && cd results
+          git init -q && git checkout -q -b results
+          git -c user.name=spike -c user.email=spike@invalid add -A
+          git -c user.name=spike -c user.email=spike@invalid commit -qm "spike-store results for $GITHUB_SHA (run $GITHUB_RUN_ID)"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" HEAD:refs/heads/spike/store-results
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
