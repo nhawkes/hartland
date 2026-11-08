@@ -134,5 +134,13 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
 ## Open questions
 
 1. GHCR: referrers API, rate limits, behaviour with many small blobs.
-2. buck2 executor settings for local execution with a remote cache.
-3. Actions concurrency limits and terms of use for long-lived worker jobs.
+2. Actions concurrency limits and terms of use for long-lived worker jobs.
+
+## Settled
+
+- buck2 local execution with a remote cache: `CommandExecutorConfig(
+  local_enabled = True, remote_enabled = False, remote_cache_enabled = True,
+  allow_cache_uploads = True)` is a distinct executor in buck2
+  (`RemoteEnabledExecutor::Local`): actions run locally, the RE action cache
+  is queried, and local results are uploaded. Source:
+  app/buck2_build_api/src/interpreter/rule_defs/command_executor_config.rs.
