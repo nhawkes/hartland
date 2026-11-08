@@ -82,6 +82,8 @@ enum Request {
     PutBlob { digest: Digest },
     /// Worker to coordinator; body is a signed envelope.
     Signed,
+    /// Worker to coordinator: every Directory under `root`, at once.
+    GetTree { root: Digest },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -102,6 +104,9 @@ enum Response {
     Batch,
     /// Body: the blob.
     Blob,
+    /// Body: the exact bytes of the tree's Directory blobs, each preceded
+    /// by its length (u32, big-endian).
+    Tree,
     Missing,
     Ok,
     Refused {
@@ -454,8 +459,49 @@ impl Pool {
     }
 
     /// Serves a member's requests: inputs, outputs, signed batches.
-    async fn serve_member(&self, conn: &Connection, key: &PublicKey) {
-        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+    /// Every Directory blob under `root` that we hold, in one reply (a
+    /// toolchain tree is thousands of directories). Raw bytes: digests are
+    /// of the bytes, and re-encoding need not reproduce them.
+    async fn tree(&self, root: Digest) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(d) = stack.pop() {
+            if !seen.insert(d.hash) {
+                continue;
+            }
+            let Some(blob) = self.store.get_blob(&d.hash).await else {
+                continue;
+            };
+            let Ok(dir) = re::Directory::decode(blob.data().clone()) else {
+                continue;
+            };
+            stack.extend(
+                dir.directories
+                    .iter()
+                    .filter_map(|n| Digest::try_from(n.digest.as_ref()).ok()),
+            );
+            let Ok(len) = u32::try_from(blob.data().len()) else {
+                continue;
+            };
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(blob.data());
+        }
+        out
+    }
+
+    /// Requests are served concurrently: a worker fetches thousands of input
+    /// files the first time it sees a toolchain, and one at a time that
+    /// costs a round trip each.
+    async fn serve_member(self: &Arc<Pool>, conn: &Connection, key: &PublicKey) {
+        while let Ok((send, recv)) = conn.accept_bi().await {
+            let (pool, key) = (self.clone(), *key);
+            tokio::spawn(async move { pool.serve_request(send, recv, &key).await });
+        }
+    }
+
+    async fn serve_request(&self, mut send: SendStream, mut recv: RecvStream, key: &PublicKey) {
+        {
             let result: Result<(), PeerError> = async {
                 let (req, body) = read_msg::<Request>(&mut recv).await?;
                 match req {
@@ -472,6 +518,10 @@ impl Pool {
                     Request::Signed => {
                         self.accept_batch(key, body).await;
                         write_msg(&mut send, &Response::Ok, &[]).await
+                    }
+                    Request::GetTree { root } => {
+                        let body = self.tree(root).await;
+                        write_msg(&mut send, &Response::Tree, &body).await
                     }
                     other => Err(PeerError::Protocol(format!("unexpected {other:?}"))),
                 }
@@ -551,6 +601,47 @@ impl Store for RemoteStore {
 
     async fn get_action_result(&self, _: &crate::digest::ActionId) -> Option<re::ActionResult> {
         None
+    }
+
+    /// One request for every Directory in the tree, then every missing file,
+    /// 64 at a time: the executor then materialises from local disk.
+    async fn prefetch_tree(&self, root: &Digest) {
+        use futures::StreamExt as _;
+        let Ok((Response::Tree, mut body)) =
+            call(&self.conn, &Request::GetTree { root: *root }, &[]).await
+        else {
+            return;
+        };
+        let mut files = Vec::new();
+        while body.len() >= 4 {
+            let len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+            if body.len() < 4 + len {
+                break;
+            }
+            let raw = body.slice(4..4 + len);
+            body = body.slice(4 + len..);
+            let Ok(dir) = re::Directory::decode(raw.clone()) else {
+                break;
+            };
+            // Stored under the digest of these exact bytes: the executor asks
+            // for the digests the tree names, so anything else is unused.
+            let _ = self.local.put_blob(&Blob::new(raw)).await;
+            files.extend(
+                dir.files
+                    .iter()
+                    .filter_map(|f| Digest::try_from(f.digest.as_ref()).ok()),
+            );
+        }
+        let started = Instant::now();
+        let n = files.len();
+        futures::stream::iter(files)
+            .for_each_concurrent(64, |d| async move {
+                if !self.local.has_blob(&d.hash).await {
+                    let _ = self.get_blob(&d.hash).await;
+                }
+            })
+            .await;
+        tracing::info!(files = n, elapsed = ?started.elapsed(), "prefetched an input tree");
     }
 
     async fn put_action_result(

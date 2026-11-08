@@ -32,6 +32,8 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 
 const MAX_BATCH_BYTES: i64 = 4 << 20;
+/// Longest a worker may take over one action before it runs locally instead.
+const WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45 * 60);
 const MAX_MESSAGE_BYTES: usize = 64 << 20;
 const READ_CHUNK: usize = 1 << 20;
 /// Concurrent store operations per request (e.g. FindMissingBlobs batches).
@@ -87,6 +89,10 @@ pub trait Store: Send + Sync + 'static {
     ) -> Result<usize, StoreError> {
         Ok(0)
     }
+
+    /// About to read the whole tree under `root`: stores that fetch over a
+    /// network get it all at once here. Local stores do nothing.
+    async fn prefetch_tree(&self, _root: &Digest) {}
 }
 
 /// Blobs and action results on local disk.
@@ -273,7 +279,16 @@ impl Proxy {
                     .pool
                     .as_ref()
                     .expect("a worker slot comes from the pool");
-                match pool.execute(&slot, action).await {
+                // A worker that has not answered by then is given up on: the action
+                // runs locally, so a stuck worker cannot hold up the build.
+                let answer = tokio::time::timeout(WORKER_TIMEOUT, pool.execute(&slot, action))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(crate::worker::PeerError::Connection(
+                            "no answer in time".into(),
+                        ))
+                    });
+                match answer {
                     Ok((r, cacheable)) if crate::proxy::outputs_present(&*self.store, &r).await => {
                         if cacheable {
                             self.store

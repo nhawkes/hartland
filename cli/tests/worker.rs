@@ -274,3 +274,87 @@ async fn worker_refuses_a_coordinator_from_another_run() {
         "coordinator run 100 is not the dispatching run 999"
     );
 }
+
+/// Prefetches a tree, then reports whether every blob in it is local.
+struct TreeRunner {
+    store: Arc<dyn Store>,
+    root: Digest,
+    blobs: Vec<Digest>,
+    found: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Runner for TreeRunner {
+    async fn run(&self, _action: ActionDigest) -> Result<re::ActionResult, String> {
+        self.store.prefetch_tree(&self.root).await;
+        for d in &self.blobs {
+            // The worker store's has_blob answers from its local disk only.
+            if self.store.has_blob(&d.hash).await {
+                self.found.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        Ok(re::ActionResult::default())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_prefetches_a_whole_tree_in_one_go() {
+    use prost::Message as _;
+    let c = coordinator().await;
+    // root/{a, sub/{b, c}}
+    let files: Vec<Blob> = (0..3)
+        .map(|i| Blob::new(format!("file {i}").into_bytes()))
+        .collect();
+    for f in &files {
+        c.store.put_blob(f).await.unwrap();
+    }
+    let node = |name: &str, f: &Blob| re::FileNode {
+        name: name.into(),
+        digest: Some(f.digest().into()),
+        ..Default::default()
+    };
+    let sub = re::Directory {
+        files: vec![node("b", &files[1]), node("c", &files[2])],
+        ..Default::default()
+    };
+    let sub_blob = Blob::new(sub.encode_to_vec());
+    let root = re::Directory {
+        files: vec![node("a", &files[0])],
+        directories: vec![re::DirectoryNode {
+            name: "sub".into(),
+            digest: Some(sub_blob.digest().into()),
+        }],
+        ..Default::default()
+    };
+    let root_blob = Blob::new(root.encode_to_vec());
+    c.store.put_blob(&sub_blob).await.unwrap();
+    c.store.put_blob(&root_blob).await.unwrap();
+
+    let mut blobs: Vec<Digest> = files.iter().map(Blob::digest).collect();
+    blobs.extend([sub_blob.digest(), root_blob.digest()]);
+    let expected = blobs.len();
+    let found = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (config, _wdir) = worker_config(&c, identity(6, "500", "workflow_dispatch", REPO), "100");
+    let (root_digest, f) = (root_blob.digest(), found.clone());
+    let worker = tokio::spawn(run_worker(config, move |store| {
+        Arc::new(TreeRunner {
+            store,
+            root: root_digest,
+            blobs,
+            found: f,
+        }) as Arc<dyn Runner>
+    }));
+    assert!(joined(&c.pool).await);
+    let slot = c.pool.reserve().unwrap();
+    c.pool
+        .execute(&slot, Digest::of(b"tree action").into())
+        .await
+        .unwrap();
+    drop(slot);
+    assert_eq!(
+        found.load(std::sync::atomic::Ordering::Acquire),
+        expected,
+        "every directory and file is local after one prefetch"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(20), worker).await;
+}
