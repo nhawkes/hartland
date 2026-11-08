@@ -113,12 +113,16 @@ def tree_cxx_link(
         archives: list[Artifact],
         libc: ZigLibcInfo,
         flags: list[str],
-        target: str):
+        target: str,
+        whole_archives: list[Artifact] = []):
     """Links a static C++ executable against `libc`, with Zig's libc++.
-    `archives` must be in link order (dependents before dependencies).
+    `archives` must be in link order (dependents before dependencies);
+    `whole_archives` are linked entirely, like objects (for code that only
+    registers itself through static constructors).
     `flags` should carry the optimisation level: zig builds libc++ for the
     link in the mode it implies (no -O means Debug, with UBSan traps)."""
-    argsfile = actions.write("link.args", objects + archives)
+    whole = ["-Wl,--whole-archive"] + whole_archives + ["-Wl,--no-whole-archive"] if whole_archives else []
+    argsfile = actions.write("link.args", objects + whole + archives)
     actions.run(
         cmd_args(
             zig,
@@ -130,7 +134,7 @@ def tree_cxx_link(
             cmd_args(argsfile, format = "@{}"),
             "-o",
             out,
-            hidden = objects + archives,
+            hidden = objects + whole_archives + archives,
         ),
         env = zig_libc_env(libc),
         category = "link",
