@@ -34,6 +34,11 @@ pub struct Spec<'a> {
     /// Run as `SANDBOX_USER` via sudo. False only for local development,
     /// where the caller is already unprivileged.
     pub drop_user: bool,
+    /// `input` is a private directory the caller will discard: use it as the
+    /// scratch directory in place instead of copying it.
+    pub take_input: bool,
+    /// (host directory, path under the working root) mounted read-only.
+    pub ro_binds: &'a [(PathBuf, String)],
 }
 
 pub struct Outcome {
@@ -98,8 +103,7 @@ pub fn exec(spec: &Spec) -> Result<Outcome, String> {
     if spec.argv.is_empty() {
         return Err("empty argv".to_string());
     }
-    let base = std::env::temp_dir();
-    let scratch = make_scratch(&base)?;
+    let scratch = if spec.take_input { spec.input.to_path_buf() } else { make_scratch(&std::env::temp_dir())? };
     let result = exec_in(spec, &scratch);
     // Always reclaim and delete the scratch directory.
     if spec.drop_user {
@@ -124,7 +128,9 @@ fn make_scratch(base: &Path) -> Result<PathBuf, String> {
 
 fn exec_in(spec: &Spec, scratch: &Path) -> Result<Outcome, String> {
     let s = scratch.display().to_string();
-    copy_tree(spec.input, scratch)?;
+    if !spec.take_input {
+        copy_tree(spec.input, scratch)?;
+    }
     if spec.drop_user {
         sudo(&["chown", "-R", &format!("{SANDBOX_USER}:{SANDBOX_USER}"), &s])?;
     }
@@ -137,7 +143,11 @@ fn exec_in(spec: &Spec, scratch: &Path) -> Result<Outcome, String> {
         Command::new("bwrap")
     };
     cmd.args(["--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL"])
-        .args(["--tmpfs", "/", "--bind", &s, WORKDIR, "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
+        .args(["--tmpfs", "/", "--bind", &s, WORKDIR, "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+    for (host, rel) in spec.ro_binds {
+        cmd.arg("--ro-bind").arg(host).arg(format!("{WORKDIR}/{rel}"));
+    }
+    cmd
         .args(["--chdir", &format!("{WORKDIR}/{}", spec.workdir).trim_end_matches('/').to_string(), "--clearenv"]);
     for (k, v) in spec.env {
         cmd.args(["--setenv", k, v]);

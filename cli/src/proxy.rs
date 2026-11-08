@@ -54,7 +54,11 @@ impl DiskStore {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
         }
-        let tmp = self.root.join("tmp").join(format!("{}-{}", std::process::id(), sha256_hex(path.to_string_lossy().as_bytes())));
+        // Unique per write: concurrent uploads of the same blob must not share
+        // a temporary file (the loser's rename would find it gone).
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self.root.join("tmp").join(format!("{}-{n}", std::process::id()));
         std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, path).map_err(|e| e.to_string())
     }
@@ -111,6 +115,8 @@ fn err_status(code: tonic::Code, msg: String) -> Option<rpc::Status> {
 pub struct Proxy {
     store: Arc<dyn Store>,
     executor: Option<Arc<crate::execute::Executor>>,
+    /// Bounds concurrent executions (buck2 submits hundreds at once).
+    exec_slots: Arc<tokio::sync::Semaphore>,
     /// Accept UpdateActionResult from clients. Off when signing: only results
     /// of actions this proxy executed itself may be vouched for.
     accept_uploads: bool,
@@ -118,7 +124,8 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(store: Arc<dyn Store>) -> Proxy {
-        Proxy { store, executor: None, accept_uploads: true }
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        Proxy { store, executor: None, exec_slots: Arc::new(tokio::sync::Semaphore::new(cpus)), accept_uploads: true }
     }
 
     /// Enables remote execution in the sandbox and refuses client-supplied
@@ -349,6 +356,7 @@ impl re::execution_server::Execution for Proxy {
         let (result, cached_result, status) = match cached {
             Some(r) => (Some(r), true, ok_status()),
             None => {
+                let _slot = self.exec_slots.clone().acquire_owned().await.map_err(|e| Status::internal(e.to_string()))?;
                 let d = digest.clone();
                 match tokio::task::spawn_blocking(move || executor.execute(&d)).await {
                     Ok(Ok(r)) => (Some(r), false, ok_status()),

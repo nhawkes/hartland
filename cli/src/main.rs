@@ -85,6 +85,8 @@ fn sandbox_run(args: &[String]) -> Result<(), String> {
         outputs: &outputs,
         collect: std::path::Path::new(&collect),
         drop_user,
+        take_input: false,
+        ro_binds: &[],
     })?;
     use std::io::Write as _;
     std::io::stdout().write_all(&outcome.stdout).map_err(|e| e.to_string())?;
@@ -111,7 +113,14 @@ fn with_execution(
         Some("unprivileged") => false,
         Some(o) => return Err(format!("--execute wants sandbox|unprivileged, got {o}")),
     };
-    let scratch = std::path::PathBuf::from(need(f, "dir")?).join("exec");
+    // Under the system temp dir: the sandbox uid must be able to traverse to
+    // its scratch directories and the read-only directory cache.
+    let scratch = std::env::temp_dir().join(format!("hartland-exec-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
     eprintln!("hartland proxy: remote execution enabled ({})", if drop_user { "sandbox uid" } else { "unprivileged" });
     Ok(proxy.with_executor(hartland::execute::Executor::new(store, drop_user, scratch)))
 }

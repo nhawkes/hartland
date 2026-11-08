@@ -67,7 +67,6 @@ impl Executor {
         let input = base.join("in");
         let collect = base.join("out");
         std::fs::create_dir_all(&collect).map_err(|e| e.to_string())?;
-        self.materialize(&action.input_root_digest, &input)?;
 
         let outputs: Vec<String> = if !command.output_paths.is_empty() {
             command.output_paths.clone()
@@ -77,6 +76,29 @@ impl Executor {
             command.output_files.iter().chain(command.output_directories.iter()).cloned().collect()
         };
         // REAPI: the server creates the parent directories of outputs.
+        // Directories on the way to an output (or the working directory) must
+        // be real and writable; every other input subtree is mounted read-only
+        // from the directory cache instead of being written out per action.
+        let mut keep = std::collections::HashSet::new();
+        let wd_rel = command.working_directory.trim_matches('/').to_string();
+        // buck2 also passes a per-action scratch directory (as an empty input
+        // directory) that the action writes to.
+        let scratch_paths: Vec<String> = command
+            .environment_variables
+            .iter()
+            .filter(|v| v.name == "BUCK_SCRATCH_PATH" || v.name == "TMPDIR")
+            .map(|v| join_rel(&join_rel(&wd_rel, v.value.trim_matches('/')), "x"))
+            .collect();
+        for o in outputs.iter().map(|o| join_rel(&wd_rel, o)).chain(std::iter::once(join_rel(&wd_rel, "x"))).chain(scratch_paths) {
+            let mut acc = String::new();
+            for part in o.split('/').collect::<Vec<_>>().iter().rev().skip(1).rev() {
+                acc = join_rel(&acc, part);
+                keep.insert(acc.clone());
+            }
+        }
+        let mut binds = Vec::new();
+        self.materialize_mixed(&action.input_root_digest, &input, "", &keep, &mut binds)?;
+
         let wd = input.join(&command.working_directory);
         for o in &outputs {
             if let Some(parent) = Path::new(o).parent() {
@@ -92,6 +114,8 @@ impl Executor {
             outputs: &outputs,
             collect: &collect,
             drop_user: self.drop_user,
+            take_input: true,
+            ro_binds: &binds,
         })?;
 
         let mut result = re::ActionResult { exit_code: outcome.exit_code, ..Default::default() };
@@ -130,6 +154,72 @@ impl Executor {
             }
         }
         Ok(result)
+    }
+
+    /// Writes the levels of the input tree that lead to outputs; mounts every
+    /// other subtree read-only from the cache.
+    fn materialize_mixed(
+        &self,
+        d: &Option<re::Digest>,
+        dir: &Path,
+        rel: &str,
+        keep: &std::collections::HashSet<String>,
+        binds: &mut Vec<(PathBuf, String)>,
+    ) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let directory = re::Directory::decode(self.blob(d, "directory")?.as_slice()).map_err(|e| e.to_string())?;
+        self.write_files(&directory, dir)?;
+        for sub in &directory.directories {
+            check_name(&sub.name)?;
+            let sub_rel = join_rel(rel, &sub.name);
+            let path = dir.join(&sub.name);
+            let empty = sub.digest.as_ref().map(|d| d.size_bytes == 0).unwrap_or(false);
+            if keep.contains(&sub_rel) || empty {
+                // Empty directories are free to create and must stay writable.
+                self.materialize_mixed(&sub.digest, &path, &sub_rel, keep, binds)?;
+            } else {
+                let cached = self.cached_dir(&sub.digest)?;
+                std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+                binds.push((cached, sub_rel));
+            }
+        }
+        Ok(())
+    }
+
+    /// A read-only copy of a directory by digest, materialised once.
+    fn cached_dir(&self, d: &Option<re::Digest>) -> Result<PathBuf, String> {
+        let hash = &d.as_ref().ok_or("missing directory digest")?.hash;
+        let root = self.scratch.join("dircache");
+        let path = root.join(hash);
+        if path.exists() {
+            return Ok(path);
+        }
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        let tmp = tempdir(&root)?;
+        let staged = tmp.join("d");
+        self.materialize(d, &staged)?;
+        match std::fs::rename(&staged, &path) {
+            Ok(()) => {}
+            Err(_) if path.exists() => {} // another action got there first
+            Err(e) => return Err(e.to_string()),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        Ok(path)
+    }
+
+    fn write_files(&self, directory: &re::Directory, dir: &Path) -> Result<(), String> {
+        for f in &directory.files {
+            check_name(&f.name)?;
+            let path = dir.join(&f.name);
+            std::fs::write(&path, self.blob(&f.digest, "file")?).map_err(|e| e.to_string())?;
+            let mode = if f.is_executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())?;
+        }
+        for s in &directory.symlinks {
+            check_name(&s.name)?;
+            std::os::unix::fs::symlink(&s.target, dir.join(&s.name)).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     /// Writes the Directory tree rooted at `d` into `dir`.
@@ -190,6 +280,10 @@ impl Executor {
         }
         Ok(d)
     }
+}
+
+fn join_rel(a: &str, b: &str) -> String {
+    if a.is_empty() { b.to_string() } else { format!("{a}/{b}") }
 }
 
 fn check_name(n: &str) -> Result<(), String> {
