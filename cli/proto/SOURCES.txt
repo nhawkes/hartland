@@ -1,0 +1,13 @@
+# Vendored protos: source repository, commit, path
+bazelbuild/remote-apis 9e084d0e43e717128ee72b5be584a7ba33e8006b (v2.12.0)
+googleapis/googleapis bf54c1031efddde9cdfee0f89254315d0116a5f9
+9d2723bc91bd7fe154b52118cdc1818daa547c303d01cc346d7bf8fb6caa9cbc ./build/bazel/remote/execution/v2/remote_execution.proto
+22b2af125690142af1c8152ba3a4ca15ffaa1265111dedc6e39b5412989b5be1 ./build/bazel/semver/semver.proto
+e79ea741cb605a65e78ca322174764a4af9fde1962c1631e12b84c4934ba9a6c ./google/api/annotations.proto
+5e9fc117290fe7d3472791543c979bec7cf4497f3fe6ffaf9de9ae99cc4f1804 ./google/api/client.proto
+e2a1ac88c49909d4579bacbb18519085e82da32c2c7bb15c31037f3be19f667f ./google/api/field_behavior.proto
+ead99129aa15dd5f6233942030c72eec33bc0d7b1c7c260dc143293ef66c5b78 ./google/api/http.proto
+68e22c9821227b4e84c7029569fce1055c21e6ccab991e0986bc75f12ef4dd82 ./google/api/launch_stage.proto
+961b833f35f4bdc51df4bca017cffdba299893e89762bf8041465560106dd3d6 ./google/bytestream/bytestream.proto
+5d2e7f9eeb55b8417b50e0a536a092babd32d26e4fbeb7099c6cdcda6e16db9c ./google/longrunning/operations.proto
+f5bfd262e6705c7ae73f32e0ad8ee20ce8c0a2578df8c4f76ebf76b572f295ed ./google/rpc/status.proto

@@ -43,6 +43,17 @@ def _platform(ctx, name, cfg, remote):
             remote_execution_use_case = "buck2-default",
             use_windows_path_separators = False,
         )
+    elif ctx.attrs.remote_cache:
+        # Local execution, remote cache: the hartland proxy (or any REAPI
+        # cache) is queried first and local results are uploaded to it.
+        executor = CommandExecutorConfig(
+            local_enabled = True,
+            remote_enabled = False,
+            remote_cache_enabled = True,
+            allow_cache_uploads = True,
+            remote_execution_use_case = "buck2-default",
+            use_windows_path_separators = False,
+        )
     else:
         executor = CommandExecutorConfig(
             local_enabled = True,
@@ -75,5 +86,6 @@ hartland_execution_platform = rule(
         "cpu_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "remote": attrs.bool(default = False),
+        "remote_cache": attrs.bool(default = False),
     },
 )

@@ -14,7 +14,9 @@ const USAGE: &str = "usage:
   hartland sandbox setup
       Prepare a GitHub-hosted runner for sandboxed actions (needs sudo).
   hartland sandbox run --input <dir> --collect <dir> [--output <path>]... [--env K=V]... [--no-drop-user] -- <argv>...
-      Run one action in the sandbox; copy declared outputs to --collect.";
+      Run one action in the sandbox; copy declared outputs to --collect.
+  hartland proxy serve --dir <store> --listen <addr:port>
+      Serve the Remote Execution API cache (CAS, action cache, ByteStream).";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -198,6 +200,14 @@ fn run(args: &[String]) -> Result<(), String> {
         "sandbox setup" => return hartland::sandbox::setup(),
         "sandbox run" => return sandbox_run(rest),
         "oci probe" => return oci_probe(&flags(rest)?),
+        "proxy serve" => {
+            let f = flags(rest)?;
+            let store = hartland::proxy::DiskStore::new(need(&f, "dir")?.into())?;
+            let addr = need(&f, "listen")?.parse().map_err(|e| format!("--listen: {e}"))?;
+            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            eprintln!("hartland proxy listening on {addr}");
+            return rt.block_on(hartland::proxy::Proxy::new(std::sync::Arc::new(store)).serve(addr));
+        }
         _ => {}
     }
     let f = flags(rest)?;
