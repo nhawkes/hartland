@@ -25,6 +25,8 @@ pub struct Spec<'a> {
     /// argv[0] is resolved inside the sandbox, e.g. `/work/bin/sh`.
     pub argv: &'a [String],
     pub env: &'a [(String, String)],
+    /// Working directory relative to the input root ("" for the root).
+    pub workdir: &'a str,
     /// Output paths relative to the working directory.
     pub outputs: &'a [String],
     /// Where collected outputs are copied, at the same relative paths.
@@ -90,6 +92,9 @@ pub fn exec(spec: &Spec) -> Result<Outcome, String> {
     for o in spec.outputs {
         check_relative(o)?;
     }
+    if !spec.workdir.is_empty() {
+        check_relative(spec.workdir)?;
+    }
     if spec.argv.is_empty() {
         return Err("empty argv".to_string());
     }
@@ -133,7 +138,7 @@ fn exec_in(spec: &Spec, scratch: &Path) -> Result<Outcome, String> {
     };
     cmd.args(["--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL"])
         .args(["--tmpfs", "/", "--bind", &s, WORKDIR, "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
-        .args(["--chdir", WORKDIR, "--clearenv"]);
+        .args(["--chdir", &format!("{WORKDIR}/{}", spec.workdir).trim_end_matches('/').to_string(), "--clearenv"]);
     for (k, v) in spec.env {
         cmd.args(["--setenv", k, v]);
     }
@@ -146,7 +151,7 @@ fn exec_in(spec: &Spec, scratch: &Path) -> Result<Outcome, String> {
     }
     let mut missing = Vec::new();
     for o in spec.outputs {
-        let src = scratch.join(o);
+        let src = scratch.join(spec.workdir).join(o);
         // symlink_metadata: never follow a link the action planted.
         match std::fs::symlink_metadata(&src) {
             Ok(_) => {

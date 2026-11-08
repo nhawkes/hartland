@@ -110,11 +110,23 @@ fn err_status(code: tonic::Code, msg: String) -> Option<rpc::Status> {
 #[derive(Clone)]
 pub struct Proxy {
     store: Arc<dyn Store>,
+    executor: Option<Arc<crate::execute::Executor>>,
+    /// Accept UpdateActionResult from clients. Off when signing: only results
+    /// of actions this proxy executed itself may be vouched for.
+    accept_uploads: bool,
 }
 
 impl Proxy {
     pub fn new(store: Arc<dyn Store>) -> Proxy {
-        Proxy { store }
+        Proxy { store, executor: None, accept_uploads: true }
+    }
+
+    /// Enables remote execution in the sandbox and refuses client-supplied
+    /// action results.
+    pub fn with_executor(mut self, executor: crate::execute::Executor) -> Proxy {
+        self.executor = Some(Arc::new(executor));
+        self.accept_uploads = false;
+        self
     }
 
     pub async fn serve(self, addr: std::net::SocketAddr) -> Result<(), String> {
@@ -122,6 +134,7 @@ impl Proxy {
             .add_service(CapabilitiesServer::new(self.clone()))
             .add_service(ContentAddressableStorageServer::new(self.clone()).max_decoding_message_size(64 << 20))
             .add_service(ActionCacheServer::new(self.clone()))
+            .add_service(re::execution_server::ExecutionServer::new(self.clone()))
             .add_service(ByteStreamServer::new(self).max_decoding_message_size(64 << 20))
             .serve(addr)
             .await
@@ -142,7 +155,12 @@ impl Capabilities for Proxy {
                 symlink_absolute_path_strategy: re::symlink_absolute_path_strategy::Value::Disallowed as i32,
                 ..Default::default()
             }),
-            execution_capabilities: None,
+            execution_capabilities: self.executor.as_ref().map(|_| re::ExecutionCapabilities {
+                digest_function: DigestFn::Sha256 as i32,
+                exec_enabled: true,
+                digest_functions: vec![DigestFn::Sha256 as i32],
+                ..Default::default()
+            }),
             low_api_version: Some(semver(2, 0)),
             high_api_version: Some(semver(2, 12)),
             ..Default::default()
@@ -219,6 +237,9 @@ impl ActionCache for Proxy {
     }
 
     async fn update_action_result(&self, req: Request<re::UpdateActionResultRequest>) -> Result<Response<re::ActionResult>, Status> {
+        if !self.accept_uploads {
+            return Err(Status::permission_denied("this proxy only stores results of actions it executed"));
+        }
         let req = req.into_inner();
         let (hash, size) = check_digest(&req.action_digest)?;
         let result = req.action_result.ok_or_else(|| Status::invalid_argument("missing action_result"))?;
@@ -301,5 +322,57 @@ impl ByteStream for Proxy {
         let (hash, size) = parse_resource(&req.into_inner().resource_name)?;
         let complete = self.store.has_blob(&hash);
         Ok(Response::new(QueryWriteStatusResponse { committed_size: if complete { size } else { 0 }, complete }))
+    }
+}
+
+fn any<M: prost::Message>(type_name: &str, m: &M) -> prost_types::Any {
+    prost_types::Any { type_url: format!("type.googleapis.com/{type_name}"), value: m.encode_to_vec() }
+}
+
+#[tonic::async_trait]
+impl re::execution_server::Execution for Proxy {
+    type ExecuteStream = Pin<Box<dyn Stream<Item = Result<crate::reapi::google::longrunning::Operation, Status>> + Send>>;
+    type WaitExecutionStream = Self::ExecuteStream;
+
+    async fn execute(&self, req: Request<re::ExecuteRequest>) -> Result<Response<Self::ExecuteStream>, Status> {
+        use crate::reapi::google::longrunning::{Operation, operation};
+        let executor = self.executor.clone().ok_or_else(|| Status::unimplemented("remote execution is not enabled"))?;
+        let req = req.into_inner();
+        let (hash, size) = check_digest(&req.action_digest)?;
+        let digest = re::Digest { hash: hash.clone(), size_bytes: size };
+
+        let cached = if req.skip_cache_lookup {
+            None
+        } else {
+            self.store.get_action_result(&hash).filter(|r| outputs_present(&*self.store, r))
+        };
+        let (result, cached_result, status) = match cached {
+            Some(r) => (Some(r), true, ok_status()),
+            None => {
+                let d = digest.clone();
+                match tokio::task::spawn_blocking(move || executor.execute(&d)).await {
+                    Ok(Ok(r)) => (Some(r), false, ok_status()),
+                    Ok(Err(e)) => (None, false, err_status(tonic::Code::Internal, e)),
+                    Err(e) => (None, false, err_status(tonic::Code::Internal, e.to_string())),
+                }
+            }
+        };
+        let response = re::ExecuteResponse { result, cached_result, status, ..Default::default() };
+        let metadata = re::ExecuteOperationMetadata {
+            stage: re::execution_stage::Value::Completed as i32,
+            action_digest: Some(digest),
+            ..Default::default()
+        };
+        let op = Operation {
+            name: format!("executions/{hash}"),
+            metadata: Some(any("build.bazel.remote.execution.v2.ExecuteOperationMetadata", &metadata)),
+            done: true,
+            result: Some(operation::Result::Response(any("build.bazel.remote.execution.v2.ExecuteResponse", &response))),
+        };
+        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(op)]))))
+    }
+
+    async fn wait_execution(&self, _: Request<re::WaitExecutionRequest>) -> Result<Response<Self::WaitExecutionStream>, Status> {
+        Err(Status::unimplemented("executions complete within Execute"))
     }
 }

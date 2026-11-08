@@ -33,12 +33,16 @@ def _platform(ctx, name, cfg, remote):
         _check_image(ctx.attrs.container_image)
         props = dict(_REMOTE_PROPERTIES)
         props["container-image"] = ctx.attrs.container_image
+        # remote_only (attested builds): nothing runs locally, so no build
+        # code shares a uid with the signing proxy, and nothing is uploaded
+        # from the client: the proxy only vouches for actions it executed.
+        remote_only = ctx.attrs.remote_only
         executor = CommandExecutorConfig(
-            # Local stays enabled only for actions the prelude marks local_only.
-            local_enabled = True,
+            # Otherwise local stays enabled for actions marked local_only.
+            local_enabled = not remote_only,
             remote_enabled = True,
             remote_cache_enabled = True,
-            allow_cache_uploads = True,
+            allow_cache_uploads = not remote_only,
             remote_execution_properties = props,
             remote_execution_use_case = "buck2-default",
             use_windows_path_separators = False,
@@ -87,5 +91,6 @@ hartland_execution_platform = rule(
         "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "remote": attrs.bool(default = False),
         "remote_cache": attrs.bool(default = False),
+        "remote_only": attrs.bool(default = False),
     },
 )

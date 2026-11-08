@@ -81,6 +81,7 @@ fn sandbox_run(args: &[String]) -> Result<(), String> {
         input: std::path::Path::new(&input),
         argv,
         env: &env,
+        workdir: "",
         outputs: &outputs,
         collect: std::path::Path::new(&collect),
         drop_user,
@@ -95,6 +96,24 @@ fn sandbox_run(args: &[String]) -> Result<(), String> {
         return Err(format!("action exited with {}", outcome.exit_code));
     }
     Ok(())
+}
+
+/// `--execute sandbox` runs actions as the sandbox uid (runners);
+/// `--execute unprivileged` runs bwrap as the current user (local dev).
+fn with_execution(
+    f: &HashMap<String, String>,
+    proxy: hartland::proxy::Proxy,
+    store: std::sync::Arc<dyn hartland::proxy::Store>,
+) -> Result<hartland::proxy::Proxy, String> {
+    let drop_user = match f.get("execute").map(String::as_str) {
+        None => return Ok(proxy),
+        Some("sandbox") => true,
+        Some("unprivileged") => false,
+        Some(o) => return Err(format!("--execute wants sandbox|unprivileged, got {o}")),
+    };
+    let scratch = std::path::PathBuf::from(need(f, "dir")?).join("exec");
+    eprintln!("hartland proxy: remote execution enabled ({})", if drop_user { "sandbox uid" } else { "unprivileged" });
+    Ok(proxy.with_executor(hartland::execute::Executor::new(store, drop_user, scratch)))
 }
 
 fn report_publish(r: Result<Result<usize, String>, tokio::task::JoinError>) {
@@ -381,13 +400,15 @@ fn run(args: &[String]) -> Result<(), String> {
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
             if f.get("registry").is_none() {
                 eprintln!("hartland proxy (disk) listening on {addr}");
-                return rt.block_on(hartland::proxy::Proxy::new(std::sync::Arc::new(disk)).serve(addr));
+                let store: std::sync::Arc<dyn hartland::proxy::Store> = std::sync::Arc::new(disk);
+                return rt.block_on(with_execution(&f, hartland::proxy::Proxy::new(store.clone()), store)?.serve(addr));
             }
             let store = std::sync::Arc::new(ghcr_store(&f, disk)?);
             let every: u64 = f.get("publish-every").map(|s| s.parse()).transpose().map_err(|e| format!("--publish-every: {e}"))?.unwrap_or(300);
             eprintln!("hartland proxy (registry) listening on {addr}");
             return rt.block_on(async move {
-                let serve = hartland::proxy::Proxy::new(store.clone()).serve(addr);
+                let dyn_store: std::sync::Arc<dyn hartland::proxy::Store> = store.clone();
+                let serve = with_execution(&f, hartland::proxy::Proxy::new(dyn_store.clone()), dyn_store)?.serve(addr);
                 let publisher = store.clone();
                 let periodic = async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(every.max(1)));
