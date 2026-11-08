@@ -159,6 +159,9 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
   re-promoted all 1364 to GHCR although its index already held them; reused
   results already in a registry index are now skipped, and a batch is never
   indexed twice.
+  Next run (builder 2288dd1): first tier verified 1364 results in ~1.5 s,
+  the registry index read added ~1.5 s, nothing re-promoted; phase 1
+  (incl. package attestations) ~11 s, fresh-proxy rebuild ~8 s, 100% hits.
 
 - Package attestations (hartland-packages run 42492602972, builder
   1bc0a13): one statement per target, subjects = output files by sha256,
