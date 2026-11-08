@@ -30,14 +30,15 @@ use crate::oci::{Reference, Registry, Tag};
 use crate::proxy::{DiskStore, Store, StoreError, direct_blobs};
 use crate::reapi::re;
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
+use crossbeam_queue::SegQueue;
 use futures::{StreamExt as _, TryStreamExt as _};
 use oci_spec::image::{
     Descriptor, DescriptorBuilder, ImageManifest, ImageManifestBuilder, MediaType,
 };
 use prost::Message as _;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::OnceCell;
 
 const ARTIFACT_TYPE: &str = "application/vnd.hartland.action-result.v0";
@@ -65,6 +66,7 @@ pub enum Promote {
 
 /// What the registry holds of a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum InRegistry {
     No,
     /// Listed in an index: a reader finds it with one request per batch.
@@ -73,15 +75,79 @@ enum InRegistry {
     ManifestOnly,
 }
 
-/// A trusted result and what we know about where it is.
+/// An `InRegistry` that changes in place, without a lock.
+struct RegistryState(AtomicU8);
+
+impl RegistryState {
+    fn new(s: InRegistry) -> RegistryState {
+        RegistryState(AtomicU8::new(s as u8))
+    }
+
+    fn get(&self) -> InRegistry {
+        match self.0.load(Ordering::Acquire) {
+            0 => InRegistry::No,
+            1 => InRegistry::Indexed,
+            _ => InRegistry::ManifestOnly,
+        }
+    }
+
+    /// Moves `from` to `Indexed`; true for exactly one caller.
+    fn claim(&self, from: InRegistry) -> bool {
+        self.0
+            .compare_exchange(
+                from as u8,
+                InRegistry::Indexed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn set_indexed(&self) {
+        self.0.store(InRegistry::Indexed as u8, Ordering::Release);
+    }
+}
+
+/// A trusted result and what we know about where it is. The flags change
+/// as the run goes on; they are atomics, so readers never wait.
 struct Known {
     result: CachedResult,
     batch: BatchId,
+    built_here: bool,
+    in_first_tier: AtomicBool,
+    in_registry: RegistryState,
+    /// Served to a client this run.
+    used: AtomicBool,
+}
+
+/// Where a result starts out.
+struct Origin {
+    batch: BatchId,
+    built_here: bool,
     in_first_tier: bool,
     in_registry: InRegistry,
-    built_here: bool,
-    /// Served to a client this run.
     used: bool,
+}
+
+impl Known {
+    fn new(result: CachedResult, o: Origin) -> Known {
+        Known {
+            result,
+            batch: o.batch,
+            built_here: o.built_here,
+            in_first_tier: AtomicBool::new(o.in_first_tier),
+            in_registry: RegistryState::new(o.in_registry),
+            used: AtomicBool::new(o.used),
+        }
+    }
+
+    fn used(&self) -> bool {
+        self.used.load(Ordering::Acquire)
+    }
+
+    fn in_first_tier(&self) -> bool {
+        self.in_first_tier.load(Ordering::Acquire)
+    }
 }
 
 /// Registry writes to make: batches (restricted to some actions) to push in
@@ -140,14 +206,14 @@ pub struct GhcrStore {
     jwks: Jwks,
     l1: Option<L1>,
     promote: Promote,
-    pending: Mutex<Vec<Pending>>,
-    known: DashMap<ActionId, Known>,
-    envelopes: DashMap<BatchId, Bytes>,
+    pending: SegQueue<Pending>,
+    known: papaya::HashMap<ActionId, Known>,
+    envelopes: papaya::HashMap<BatchId, Bytes>,
     /// Blobs that known results reference: present somewhere, fetched on
     /// demand.
-    referenced: DashSet<Sha256>,
+    referenced: papaya::HashSet<Sha256>,
     /// Verified statements, for per-action registry lookups.
-    statements: DashMap<BatchId, Arc<Batch>>,
+    statements: papaya::HashMap<BatchId, Arc<Batch>>,
     /// Every reader's index has been read (see `load_registry`).
     registry_loaded: OnceCell<()>,
 }
@@ -177,11 +243,11 @@ impl GhcrStore {
             jwks,
             l1: None,
             promote: Promote::All,
-            pending: Mutex::default(),
-            known: DashMap::new(),
-            envelopes: DashMap::new(),
-            referenced: DashSet::new(),
-            statements: DashMap::new(),
+            pending: SegQueue::new(),
+            known: papaya::HashMap::new(),
+            envelopes: papaya::HashMap::new(),
+            referenced: papaya::HashSet::new(),
+            statements: papaya::HashMap::new(),
             registry_loaded: OnceCell::new(),
         }
     }
@@ -198,41 +264,33 @@ impl GhcrStore {
         self.known.len()
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, Vec<Pending>> {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// Records a verified batch from the first tier or a registry index.
     fn absorb(&self, batch: VerifiedBatch, from_first_tier: bool) {
+        let (known, referenced) = (self.known.pin(), self.referenced.pin());
         for r in batch.results {
             for h in &r.blobs {
-                self.referenced.insert(*h);
+                referenced.insert(*h);
             }
-            self.known
-                .entry(r.action)
-                .and_modify(|k| {
-                    if from_first_tier {
-                        k.in_first_tier = true;
-                    } else {
-                        k.in_registry = InRegistry::Indexed;
-                    }
-                })
-                .or_insert_with(|| Known {
-                    result: r,
-                    batch: batch.id,
-                    in_first_tier: from_first_tier,
-                    in_registry: if from_first_tier {
-                        InRegistry::No
-                    } else {
-                        InRegistry::Indexed
-                    },
-                    built_here: false,
-                    used: false,
-                });
+            let origin = Origin {
+                batch: batch.id,
+                built_here: false,
+                in_first_tier: from_first_tier,
+                in_registry: if from_first_tier {
+                    InRegistry::No
+                } else {
+                    InRegistry::Indexed
+                },
+                used: false,
+            };
+            let k = known.get_or_insert_with(r.action, || Known::new(r, origin));
+            // Already known from the other tier: record that it is here too.
+            if from_first_tier {
+                k.in_first_tier.store(true, Ordering::Release);
+            } else {
+                k.in_registry.set_indexed();
+            }
         }
-        self.envelopes.insert(batch.id, batch.envelope);
+        self.envelopes.pin().insert(batch.id, batch.envelope);
     }
 
     /// Loads the first tier: enough to start serving. Registry indexes are
@@ -328,7 +386,7 @@ impl GhcrStore {
     }
 
     async fn statement(&self, reg: &Registry, id: BatchId) -> Option<Arc<Batch>> {
-        if let Some(b) = self.statements.get(&id) {
+        if let Some(b) = self.statements.pin().get(&id) {
             return Some(b.clone());
         }
         let bytes = reg.get_blob(&id.0).await.ok()??;
@@ -339,8 +397,8 @@ impl GhcrStore {
                 .ok()?
                 .statement,
         );
-        self.envelopes.insert(id, bytes);
-        self.statements.insert(id, batch.clone());
+        self.envelopes.pin().insert(id, bytes);
+        self.statements.pin().insert(id, batch.clone());
         Some(batch)
     }
 
@@ -380,24 +438,27 @@ impl GhcrStore {
             .filter_map(|l| Sha256::from_oci(l.digest()).ok())
             .filter(|h| *h != batch_id.0)
             .collect();
+        let referenced = self.referenced.pin();
         for h in &blobs {
-            self.referenced.insert(*h);
+            referenced.insert(*h);
         }
-        self.known.insert(
+        let cached = CachedResult {
             action,
-            Known {
-                result: CachedResult {
-                    action,
-                    result: result.clone(),
-                    blobs,
-                },
-                batch: batch_id,
-                in_first_tier: false,
-                in_registry: InRegistry::ManifestOnly,
-                built_here: false,
-                used: true,
-            },
-        );
+            result: result.clone(),
+            blobs,
+        };
+        let origin = Origin {
+            batch: batch_id,
+            built_here: false,
+            in_first_tier: false,
+            in_registry: InRegistry::ManifestOnly,
+            used: true,
+        };
+        let known = self.known.pin();
+        known
+            .get_or_insert_with(action, || Known::new(cached, origin))
+            .used
+            .store(true, Ordering::Release);
         Some(result)
     }
 
@@ -421,12 +482,12 @@ impl GhcrStore {
     fn results_of<'a>(&self, actions: impl IntoIterator<Item = &'a ActionId>) -> Vec<CachedResult> {
         actions
             .into_iter()
-            .filter_map(|a| self.known.get(a).map(|k| k.result.clone()))
+            .filter_map(|a| self.known.pin().get(a).map(|k| k.result.clone()))
             .collect()
     }
 
     async fn envelope(&self, id: &BatchId) -> Option<Bytes> {
-        if let Some(e) = self.envelopes.get(id) {
+        if let Some(e) = self.envelopes.pin().get(id) {
             return Some(e.clone());
         }
         self.any_blob(&id.0).await.map(Blob::into_data)
@@ -559,7 +620,7 @@ impl GhcrStore {
 
     /// Signs the results executed so far as one batch.
     async fn sign_pending(&self) -> Result<usize, StoreError> {
-        let pending: Vec<Pending> = std::mem::take(&mut *self.pending());
+        let pending: Vec<Pending> = std::iter::from_fn(|| self.pending.pop()).collect();
         if pending.is_empty() {
             return Ok(0);
         }
@@ -590,19 +651,17 @@ impl GhcrStore {
                 .await?;
         }
         let n = results.len();
-        self.envelopes.insert(id, envelope);
+        self.envelopes.pin().insert(id, envelope);
+        let known = self.known.pin();
         for r in results {
-            self.known.insert(
-                r.action,
-                Known {
-                    result: r,
-                    batch: id,
-                    in_first_tier: self.l1.is_some(),
-                    in_registry: InRegistry::No,
-                    built_here: true,
-                    used: false,
-                },
-            );
+            let origin = Origin {
+                batch: id,
+                built_here: true,
+                in_first_tier: self.l1.is_some(),
+                in_registry: InRegistry::No,
+                used: false,
+            };
+            known.insert(r.action, Known::new(r, origin));
         }
         tracing::info!(results = n, batch = %id, "signed new results");
         Ok(n)
@@ -613,23 +672,27 @@ impl GhcrStore {
     fn plan(&self) -> Plan {
         let mut plan = Plan::default();
         let mut skipped = 0;
-        for mut k in self.known.iter_mut() {
-            let push = match (self.promote, k.in_registry) {
+        for (action, k) in &self.known.pin() {
+            let state = k.in_registry.get();
+            let push = match (self.promote, state) {
                 (_, InRegistry::Indexed | InRegistry::ManifestOnly) => {
-                    skipped += usize::from(k.used && k.in_first_tier && !k.built_here);
+                    skipped += usize::from(k.used() && k.in_first_tier() && !k.built_here);
                     false
                 }
                 (_, InRegistry::No) if self.l1.is_none() => k.built_here,
-                (Promote::All, InRegistry::No) => k.built_here || (k.used && k.in_first_tier),
-                (Promote::Reused, InRegistry::No) => k.used && k.in_first_tier && !k.built_here,
+                (Promote::All, InRegistry::No) => k.built_here || (k.used() && k.in_first_tier()),
+                (Promote::Reused, InRegistry::No) => k.used() && k.in_first_tier() && !k.built_here,
                 (Promote::None, InRegistry::No) => false,
             };
-            if push {
-                plan.push.entry(k.batch).or_default().insert(*k.key());
-                k.in_registry = InRegistry::Indexed;
-            } else if k.used && k.in_registry == InRegistry::ManifestOnly {
-                plan.index.entry(k.batch).or_default().insert(*k.key());
-                k.in_registry = InRegistry::Indexed;
+            // Claiming the state change plans each result once, however many
+            // publishes run at the same time.
+            if push && k.in_registry.claim(InRegistry::No) {
+                plan.push.entry(k.batch).or_default().insert(*action);
+            } else if state == InRegistry::ManifestOnly
+                && k.used()
+                && k.in_registry.claim(InRegistry::ManifestOnly)
+            {
+                plan.index.entry(k.batch).or_default().insert(*action);
             }
         }
         if skipped > 0 {
@@ -645,8 +708,10 @@ impl GhcrStore {
     /// under their own envelopes, so the next run needs no registry reads.
     async fn write_through(&self, l1: &L1) -> Result<(), StoreError> {
         let mut by_batch: BTreeMap<BatchId, Vec<ActionId>> = BTreeMap::new();
-        for k in self.known.iter().filter(|k| k.used && !k.in_first_tier) {
-            by_batch.entry(k.batch).or_default().push(*k.key());
+        for (action, k) in &self.known.pin() {
+            if k.used() && !k.in_first_tier() {
+                by_batch.entry(k.batch).or_default().push(*action);
+            }
         }
         let mut written = 0;
         for (id, actions) in &by_batch {
@@ -656,9 +721,10 @@ impl GhcrStore {
             let results = self.results_of(actions);
             self.save_first_tier(l1, *id, envelope, &results).await?;
             written += results.len();
+            let known = self.known.pin();
             for a in actions {
-                if let Some(mut k) = self.known.get_mut(a) {
-                    k.in_first_tier = true;
+                if let Some(k) = known.get(a) {
+                    k.in_first_tier.store(true, Ordering::Release);
                 }
             }
         }
@@ -747,8 +813,9 @@ impl GhcrStore {
 
     /// A known result, marked as used.
     fn serve_known(&self, action: &ActionId) -> Option<re::ActionResult> {
-        let mut k = self.known.get_mut(action)?;
-        k.used = true;
+        let known = self.known.pin();
+        let k = known.get(action)?;
+        k.used.store(true, Ordering::Release);
         Some(k.result.result.clone())
     }
 }
@@ -758,7 +825,7 @@ impl Store for GhcrStore {
     /// Local, first tier, or referenced by a verified result (fetched on
     /// demand); anything else buck2 simply uploads.
     async fn has_blob(&self, hash: &Sha256) -> bool {
-        if self.local.has_blob(hash).await || self.referenced.contains(hash) {
+        if self.local.has_blob(hash).await || self.referenced.pin().contains(hash) {
             return true;
         }
         match &self.l1 {
@@ -803,7 +870,7 @@ impl Store for GhcrStore {
         result: &re::ActionResult,
     ) -> Result<(), StoreError> {
         self.local.put_action_result(action, result).await?;
-        self.pending().push(Pending {
+        self.pending.push(Pending {
             action,
             result: result.clone(),
         });

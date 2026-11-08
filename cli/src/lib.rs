@@ -1,5 +1,7 @@
 //! Hartland: attested builds anchored in GitHub-hosted runners.
 
+#![forbid(unsafe_code)]
+
 pub mod attest;
 pub mod bundle;
 pub mod cas;

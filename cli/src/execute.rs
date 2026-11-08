@@ -13,7 +13,6 @@ use crate::digest::{ActionDigest, Digest, ParseError, Sha256};
 use crate::proxy::{Store, StoreError};
 use crate::reapi::re;
 use crate::sandbox::{self, BadPath, RelPath, SandboxError};
-use dashmap::DashMap;
 use futures::future::BoxFuture;
 use futures::{StreamExt as _, TryStreamExt as _};
 use prost::Message as _;
@@ -60,7 +59,7 @@ pub struct Executor {
     drop_user: bool,
     scratch: PathBuf,
     /// Directory digest -> its read-only materialisation, filled exactly once.
-    dircache: DashMap<Sha256, Arc<OnceCell<PathBuf>>>,
+    dircache: papaya::HashMap<Sha256, Arc<OnceCell<PathBuf>>>,
 }
 
 /// What an action declares, parsed.
@@ -125,7 +124,7 @@ impl Executor {
             store,
             drop_user,
             scratch,
-            dircache: DashMap::new(),
+            dircache: papaya::HashMap::new(),
         }
     }
 
@@ -317,7 +316,11 @@ impl Executor {
     /// even when many actions want it at the same moment.
     async fn cached_dir(&self, d: Option<&re::Digest>) -> Result<PathBuf, ExecError> {
         let hash = Digest::try_from(d)?.hash;
-        let cell = self.dircache.entry(hash).or_default().clone();
+        let cell = self
+            .dircache
+            .pin()
+            .get_or_insert_with(hash, Arc::default)
+            .clone();
         cell.get_or_try_init(|| async {
             let root = self.scratch.join("dircache");
             let path = root.join(hash.to_string());

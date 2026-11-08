@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{Context as _, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hartland::attest::{Batch, Envelope, Pair};
