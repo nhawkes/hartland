@@ -38,7 +38,7 @@ and recorded in the attestation.
 
 A job requests an OIDC token whose audience is the digest of a statement:
 
-    aud = "hartland-attest:sha256:<digest of batch statement>"   (?)
+    aud = "hartland-attest:sha256:<digest of batch statement>"
 
 The token is a JWT signed by GitHub, binding the workflow identity, repository,
 commit and runner environment to that digest. It is verified against GitHub's
@@ -56,7 +56,12 @@ sign a forged result. Therefore the worker (our pinned code):
   its own memory, and scrubs them from every environment it passes on;
 - runs each action as a separate unprivileged uid without sudo, in its own
   namespaces: no network, no view of the worker process, fresh scratch
-  directory (? whether hosted runners allow this without root);
+  directory. Ubuntu 24.04 runners block unprivileged user namespaces
+  (AppArmor), so root creates the namespaces and drops to the sandbox uid:
+  `sudo unshare --net --pid --mount --ipc --uts --fork --mount-proc setpriv
+  --reuid=<sandbox> --regid=<sandbox> --clear-groups --no-new-privs
+  --inh-caps=-all --bounding-set=-all`. The mount namespace still needs a
+  read-only root and per-action scratch (not yet built);
 - signs only digests it computed itself from the CAS.
 
 ## Cache
@@ -100,11 +105,28 @@ dial out to a rendezvous the user provides (e.g. their own Tailscale tailnet
 with ephemeral keys) (?). Simpler first step: one job per package group,
 ordered by buck2's dependency graph, local execution plus the verified cache.
 
+## Findings (spike/oidc branch, private repo, ubuntu-24.04 runner)
+
+- A token with `aud = hartland-attest:sha256:<hex>` is issued, verifies
+  against GitHub's JWKS, and rejects a wrong audience. Claims include
+  `runner_environment: github-hosted`, `job_workflow_ref`,
+  `job_workflow_sha`, `repository`, `sha`, `run_id`.
+- Tokens live 300 s; the signature still verifies after expiry (signature-only
+  check), so they serve as durable signatures. JWKS held 4 keys: archive them.
+- As the default `runner` uid, three processes' environments expose
+  `ACTIONS_ID_TOKEN_REQUEST_TOKEN`; a separate uid sees none, has no sudo,
+  and cannot read the runner's home.
+- The root-created jail gives: sandbox uid, all capability sets empty,
+  NoNewPrivs=1, network unreachable, only its own PIDs visible, no token,
+  sudo refused. Launch overhead is about 7.6 ms per action.
+- Alternative: `sysctl kernel.apparmor_restrict_unprivileged_userns=0`, then
+  `bwrap --unshare-all` as the sandbox uid, also works.
+- Private-repo runners: 2 cores, 7 GB RAM, ~14 GB free disk.
+
 ## Open questions
 
-1. Can an OIDC token be requested with an arbitrary audience string of this
-   form, and how long is it valid?
-2. Can a hosted runner unshare namespaces and drop to another uid?
-3. GHCR: referrers API, rate limits, behaviour with many small blobs.
-4. buck2 executor settings for local execution with a remote cache.
-5. Actions concurrency limits and terms of use for long-lived worker jobs.
+1. Reusable workflow: confirm `job_workflow_ref` names the called workflow
+   when invoked from another repository.
+2. GHCR: referrers API, rate limits, behaviour with many small blobs.
+3. buck2 executor settings for local execution with a remote cache.
+4. Actions concurrency limits and terms of use for long-lived worker jobs.
