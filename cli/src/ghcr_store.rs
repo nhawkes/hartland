@@ -28,6 +28,12 @@ pub const ARTIFACT_TYPE: &str = "application/vnd.hartland.action-result.v0";
 pub const CONFIG_MEDIA_TYPE: &str = "application/vnd.hartland.reapi.action-result.v2+proto";
 pub const ENVELOPE_MEDIA_TYPE: &str = crate::attest::ENVELOPE_MEDIA_TYPE;
 pub const ANN_ENVELOPE: &str = "dev.hartland.envelope";
+pub const BUNDLE_MEDIA_TYPE: &str = "application/vnd.hartland.batch-bundle.v0+json";
+pub const INDEX_ARTIFACT_TYPE: &str = "application/vnd.hartland.index.v0";
+/// The namespace's index: a manifest whose layers are (envelope, bundle)
+/// pairs for recent batches, newest last.
+pub const INDEX_TAG: &str = "hartland-index";
+const INDEX_MAX_BATCHES: usize = 50;
 
 /// Requests in flight to the registry (GHCR: ~1.1 s per small blob upload
 /// sequentially, ~90 ms effective at 16).
@@ -46,6 +52,27 @@ pub struct GhcrStore {
     pending: Mutex<Vec<(String, i64, re::ActionResult)>>,
     /// Envelope digest -> verified statement pairs (action -> result hash).
     verified: Mutex<HashMap<String, HashMap<String, String>>>,
+    /// Results from verified batch bundles loaded from the index.
+    indexed: Mutex<HashMap<String, re::ActionResult>>,
+    /// Blobs that verified results reference and the registry retains (their
+    /// per-action manifests list them as layers): present, fetched on demand.
+    known: Mutex<std::collections::HashSet<String>>,
+}
+
+/// One batch's results, so readers need one request per batch rather than a
+/// manifest per action. Unsigned: each result is accepted only if its sha256
+/// matches the batch's signed statement; `blobs` are availability hints.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Bundle {
+    entries: Vec<BundleEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BundleEntry {
+    action: String,
+    /// base64 of the exact ActionResult bytes the statement signs.
+    result: String,
+    blobs: Vec<String>,
 }
 
 /// GHCR blob reads go via a redirect to separate storage; one early read
@@ -64,7 +91,68 @@ async fn get_blob_retrying(reg: &Registry, hash: &str) -> Result<Vec<u8>, String
 
 impl GhcrStore {
     pub fn new(local: DiskStore, readers: Vec<Registry>, writer: Option<Registry>, keyring: Keyring, jwks: Jwks) -> GhcrStore {
-        GhcrStore { local, readers, writer, keyring, jwks, pending: Mutex::new(Vec::new()), verified: Mutex::new(HashMap::new()) }
+        GhcrStore {
+            local,
+            readers,
+            writer,
+            keyring,
+            jwks,
+            pending: Mutex::new(Vec::new()),
+            verified: Mutex::new(HashMap::new()),
+            indexed: Mutex::new(HashMap::new()),
+            known: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Loads every reader's index: verifies each batch's envelope against the
+    /// keyring and keeps the bundle entries whose bytes match the signed
+    /// statement. Returns the number of results now servable.
+    pub async fn load_index(&self) -> usize {
+        for reg in &self.readers {
+            let Ok(reply) = reg.get_manifest(INDEX_TAG).await else { continue };
+            if reply.status != 200 {
+                continue;
+            }
+            let Ok(m) = serde_json::from_slice::<serde_json::Value>(&reply.body) else { continue };
+            let layers: Vec<(String, String)> = m
+                .get("layers")
+                .and_then(|l| l.as_array())
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|x| Some((x.get("mediaType")?.as_str()?.to_string(), x.get("digest")?.as_str()?.strip_prefix("sha256:")?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let batches: Vec<(String, String)> = layers
+                .windows(2)
+                .filter(|w| w[0].0 == ENVELOPE_MEDIA_TYPE && w[1].0 == BUNDLE_MEDIA_TYPE)
+                .map(|w| (w[0].1.clone(), w[1].1.clone()))
+                .collect();
+            futures::stream::iter(batches)
+                .map(|(env, bundle)| async move { self.load_batch(reg, &env, &bundle).await })
+                .buffer_unordered(4)
+                .collect::<Vec<()>>()
+                .await;
+        }
+        self.indexed.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    async fn load_batch(&self, reg: &Registry, env_hash: &str, bundle_hash: &str) {
+        let Some(pairs) = self.verified_pairs(reg, env_hash).await else { return };
+        let Ok(bytes) = get_blob_retrying(reg, bundle_hash).await else { return };
+        let Ok(bundle) = serde_json::from_slice::<Bundle>(&bytes) else { return };
+        use base64::Engine as _;
+        for e in bundle.entries {
+            let Ok(result_bytes) = base64::engine::general_purpose::STANDARD.decode(&e.result) else { continue };
+            if pairs.get(&e.action).map(String::as_str) != Some(sha256_hex(&result_bytes).as_str()) {
+                continue;
+            }
+            let Ok(result) = re::ActionResult::decode(result_bytes.as_slice()) else { continue };
+            if let (Ok(mut idx), Ok(mut known)) = (self.indexed.lock(), self.known.lock()) {
+                known.extend(e.blobs);
+                idx.insert(e.action, result);
+            }
+        }
     }
 
     async fn fetch_blob(&self, hash: &str) -> Option<Vec<u8>> {
@@ -209,7 +297,53 @@ impl GhcrStore {
             .buffer_unordered(REGISTRY_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
+
+        // The bundle, then append (envelope, bundle) to the namespace index.
+        use base64::Engine as _;
+        let bundle = Bundle {
+            entries: pending
+                .iter()
+                .zip(&configs)
+                .zip(&referenced)
+                .map(|(((action, _, _), config), refs)| BundleEntry {
+                    action: action.clone(),
+                    result: base64::engine::general_purpose::STANDARD.encode(config),
+                    blobs: refs.iter().cloned().collect(),
+                })
+                .collect(),
+        };
+        let bundle_bytes = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
+        let bundle_hash = writer.put_blob(&bundle_bytes).await?;
+        self.append_index(writer, (&env_hash, envelope.len()), (&bundle_hash, bundle_bytes.len())).await?;
         Ok(pending.len())
+    }
+
+    /// Read-modify-write of the index manifest. Concurrent publishers can
+    /// drop each other's entry; per-action manifests still serve as fallback.
+    async fn append_index(&self, writer: &Registry, envelope: (&str, usize), bundle: (&str, usize)) -> Result<(), String> {
+        let mut layers: Vec<serde_json::Value> = match writer.get_manifest(INDEX_TAG).await {
+            Ok(r) if r.status == 200 => serde_json::from_slice::<serde_json::Value>(&r.body)
+                .ok()
+                .and_then(|m| m.get("layers").and_then(|l| l.as_array()).cloned())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        layers.push(serde_json::json!({"mediaType": ENVELOPE_MEDIA_TYPE, "digest": format!("sha256:{}", envelope.0), "size": envelope.1}));
+        layers.push(serde_json::json!({"mediaType": BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{}", bundle.0), "size": bundle.1}));
+        let keep = INDEX_MAX_BATCHES * 2;
+        if layers.len() > keep {
+            layers.drain(..layers.len() - keep);
+        }
+        let empty = writer.put_blob(b"{}").await?;
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MANIFEST_MEDIA_TYPE,
+            "artifactType": INDEX_ARTIFACT_TYPE,
+            "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": format!("sha256:{empty}"), "size": 2},
+            "layers": layers,
+        });
+        writer.put_manifest(INDEX_TAG, MANIFEST_MEDIA_TYPE, &serde_json::to_vec(&manifest).map_err(|e| e.to_string())?).await?;
+        Ok(())
     }
 
     /// Every blob an action result needs: outputs, stdout/stderr, and for each
@@ -234,10 +368,10 @@ impl GhcrStore {
 
 #[async_trait::async_trait]
 impl Store for GhcrStore {
-    /// Local only: blobs of accepted remote results are prefetched, and
+    /// Local, or referenced by a verified indexed result (fetched on demand);
     /// anything else buck2 simply uploads.
     async fn has_blob(&self, hash: &str) -> bool {
-        self.local.has_blob(hash).await
+        self.local.has_blob(hash).await || self.known.lock().map(|k| k.contains(hash)).unwrap_or(false)
     }
 
     async fn get_blob(&self, hash: &str) -> Option<Vec<u8>> {
@@ -254,6 +388,9 @@ impl Store for GhcrStore {
     async fn get_action_result(&self, action: &str) -> Option<re::ActionResult> {
         // Results produced in this run are trusted; they get signed on publish.
         if let Some(r) = self.local.get_action_result(action).await {
+            return Some(r);
+        }
+        if let Some(r) = self.indexed.lock().ok().and_then(|m| m.get(action).cloned()) {
             return Some(r);
         }
         for reg in &self.readers {

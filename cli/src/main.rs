@@ -305,6 +305,8 @@ async fn proxy_serve(f: &HashMap<String, String>) -> Result<(), String> {
         return with_execution(f, hartland::proxy::Proxy::new(store.clone()), store).await?.serve(addr).await;
     }
     let store = Arc::new(ghcr_store(f, disk).await?);
+    let loaded = store.load_index().await;
+    eprintln!("hartland proxy: {loaded} signed result(s) available from registry indexes");
     let every: u64 = f.get("publish-every").map(|s| s.parse()).transpose().map_err(|e| format!("--publish-every: {e}"))?.unwrap_or(300);
     eprintln!("hartland proxy (registry) listening on {addr}");
     let dyn_store: Arc<dyn hartland::proxy::Store> = store.clone();
