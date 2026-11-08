@@ -4,7 +4,9 @@ Each source is compiled from a projection of the pinned source tree, so
 nothing is copied into the repository and the prelude's C++ machinery is not
 involved. `tree_c` takes an explicit source list; packages that discover their
 sources inside the build (from a dynamic action) call the action-level helpers
-`tree_c_includes`, `tree_c_compile` and `tree_c_archive` directly.
+`tree_c_includes`, `tree_c_compile` and `tree_c_archive` directly, and
+programs built against a libc sysroot the same way use `sysroot_c_compile`
+and `sysroot_c_link`.
 """
 
 TreeObjectsInfo = provider(fields = {
@@ -131,37 +133,53 @@ tree_c = rule(
     },
 )
 
-def _sysroot_c_binary_impl(ctx: AnalysisContext) -> list[Provider]:
-    zig = ctx.attrs._zig[RunInfo]
-    sysroot = ctx.attrs.sysroot[DefaultInfo].default_outputs[0]
-    target = ["-target", ctx.attrs.target]
-    objects = []
-    for src in ctx.attrs.srcs:
-        obj = ctx.actions.declare_output("obj", src.short_path + ".o")
-        ctx.actions.run(
-            cmd_args(
-                zig,
-                "cc",
-                target,
-                "-nostdinc",
-                cmd_args(sysroot.project("include"), format = "-isystem{}"),
-                ctx.attrs.cflags,
-                "-c",
-                src,
-                "-o",
-                obj.as_output(),
-                hidden = [sysroot],
-            ),
-            category = "cc",
-            identifier = src.short_path,
-        )
-        objects.append(obj)
-    exe = ctx.actions.declare_output(ctx.label.name)
+def sysroot_c_cmd(zig: typing.Any, sysroot: Artifact, target: str) -> cmd_args:
+    """`zig cc` for `target` against the headers of `sysroot` only
+    (-nostdinc; no zig-bundled libc headers)."""
+    return cmd_args(
+        zig,
+        "cc",
+        "-target",
+        target,
+        "-nostdinc",
+        cmd_args(sysroot.project("include"), format = "-isystem{}"),
+        hidden = [sysroot],
+    )
+
+def sysroot_c_compile(
+        actions: AnalysisActions,
+        zig: typing.Any,
+        sysroot: Artifact,
+        src: Artifact,
+        out: OutputArtifact,
+        flags: list[typing.Any],
+        hidden: list[Artifact],
+        target: str,
+        identifier: str):
+    """Compiles `src` to `out` with sysroot_c_cmd."""
+    actions.run(
+        cmd_args(sysroot_c_cmd(zig, sysroot, target), flags, "-c", src, "-o", out, hidden = hidden),
+        category = "cc",
+        identifier = identifier,
+    )
+
+def sysroot_c_link(
+        actions: AnalysisActions,
+        zig: typing.Any,
+        sysroot: Artifact,
+        objects: list[typing.Any],
+        out: OutputArtifact,
+        ldflags: list[typing.Any],
+        target: str,
+        identifier: [str, None] = None):
+    """Links a static executable from `objects` (objects or archives) and the
+    sysroot's libc: crt1.o crti.o <objects> libc.a crtn.o."""
     lib = sysroot.project("lib")
-    ctx.actions.run(
+    actions.run(
         cmd_args(
             zig,
             "cc",
+            "-target",
             target,
             "-static",
             "-nostdlib",
@@ -170,13 +188,25 @@ def _sysroot_c_binary_impl(ctx: AnalysisContext) -> list[Provider]:
             objects,
             lib.project("libc.a"),
             lib.project("crtn.o"),
-            ctx.attrs.ldflags,
+            ldflags,
             "-o",
-            exe.as_output(),
+            out,
             hidden = [sysroot],
         ),
         category = "link",
+        identifier = identifier,
     )
+
+def _sysroot_c_binary_impl(ctx: AnalysisContext) -> list[Provider]:
+    zig = ctx.attrs._zig[RunInfo]
+    sysroot = ctx.attrs.sysroot[DefaultInfo].default_outputs[0]
+    objects = []
+    for src in ctx.attrs.srcs:
+        obj = ctx.actions.declare_output("obj", src.short_path + ".o")
+        sysroot_c_compile(ctx.actions, zig, sysroot, src, obj.as_output(), ctx.attrs.cflags, [], ctx.attrs.target, src.short_path)
+        objects.append(obj)
+    exe = ctx.actions.declare_output(ctx.label.name)
+    sysroot_c_link(ctx.actions, zig, sysroot, objects, exe.as_output(), ctx.attrs.ldflags, ctx.attrs.target)
     return [DefaultInfo(default_output = exe), RunInfo(args = [exe])]
 
 # A static executable linked against a libc sysroot (no zig-bundled libc):
