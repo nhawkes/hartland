@@ -1,0 +1,20 @@
+{
+  "anonymous_manifest_status": 401,
+  "blob_exists_ms_each": 223.45666666666668,
+  "blob_failures": [],
+  "blob_get_location_host": "pkg-containers.githubusercontent.com",
+  "blob_get_status": 307,
+  "blob_push_ms_each": 79.48666666666666,
+  "blob_push_ms_total": 23846,
+  "blob_roundtrip_ok": true,
+  "blobs_found": 300,
+  "blobs_pushed": 300,
+  "entry_by_tag_same_bytes": true,
+  "entry_by_tag_status": 200,
+  "entry_digest": "sha256:edc024563acfa046c1291ae3cd27a35ccbffc32f3e44a938ebc104fb43e32ebb",
+  "parallel": 16,
+  "ratelimit_headers": [],
+  "referrers_body": "{\"errors\":[{\"code\":\"MANIFEST_UNKNOWN\",\"message\":\"manifest unknown\"}]}\n",
+  "referrers_status": 404,
+  "sig_put": "sha256:aba3f073738a8ac191d59fbc1618a422944815beb1cef0f29d00900032bdf4ba"
+}
