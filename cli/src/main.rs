@@ -26,6 +26,9 @@ const USAGE: &str = "usage:
                        [--registry ghcr.io --read ns[,ns] [--write ns] --keyring k --jwks j [--publish-every secs]
                         [--l1 <dir>] [--promote all|reused|none]]
       Serve the Remote Execution API.
+  hartland proxy promote --dir <store> --l1 <dir> --registry ghcr.io --read ns --write ns --keyring k --jwks j
+      Push the registry writes queued in the first tier's outbox (verified
+      batches only), off the build's critical path.
   hartland proxy check|put|ac-put|ac-get --addr <url> ...
       Test clients.
   hartland oci probe|retag ...
@@ -64,6 +67,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         "sandbox setup" => hartland::sandbox::setup().await,
         "sandbox run" => sandbox_run(rest).await,
         "proxy serve" => proxy_serve(&flags(rest)?).await,
+        "proxy promote" => proxy_promote(&flags(rest)?).await,
         "proxy check" => proxy_check(&flags(rest)?).await,
         "proxy put" => proxy_put(&flags(rest)?).await,
         "proxy ac-put" | "proxy ac-get" => proxy_ac(cmd == "proxy ac-put", &flags(rest)?).await,
@@ -310,6 +314,18 @@ fn report_publish(r: Result<usize, String>) {
     }
 }
 
+async fn proxy_promote(f: &HashMap<String, String>) -> Result<(), String> {
+    need(f, "l1")?;
+    need(f, "write")?;
+    let disk = hartland::proxy::DiskStore::new(need(f, "dir")?.into()).await?;
+    let store = ghcr_store(f, disk).await?;
+    let started = std::time::Instant::now();
+    let loaded = store.load_l1().await;
+    let n = store.drain_outbox().await?;
+    tracing::info!(results = n, verified = loaded, elapsed = ?started.elapsed(), "promoted outbox to the registry");
+    Ok(())
+}
+
 async fn proxy_serve(f: &HashMap<String, String>) -> Result<(), String> {
     let disk = hartland::proxy::DiskStore::new(need(f, "dir")?.into()).await?;
     let addr: std::net::SocketAddr = need(f, "listen")?.parse().map_err(|e| format!("--listen: {e}"))?;
@@ -319,8 +335,16 @@ async fn proxy_serve(f: &HashMap<String, String>) -> Result<(), String> {
         return with_execution(f, hartland::proxy::Proxy::new(store.clone()), store).await?.serve(addr).await;
     }
     let store = Arc::new(ghcr_store(f, disk).await?);
-    let loaded = store.load().await;
-    tracing::info!(results = loaded, "verified results available (first tier + registry indexes)");
+    // Serve from the first tier at once; read the registry indexes in the
+    // background (misses and publishing wait for them).
+    let loaded = store.load_l1().await;
+    tracing::info!(results = loaded, "serving; registry indexes loading in the background");
+    tokio::spawn({
+        let store = store.clone();
+        async move {
+            store.load_registry().await;
+        }
+    });
     let every: u64 = f.get("publish-every").map(|s| s.parse()).transpose().map_err(|e| format!("--publish-every: {e}"))?.unwrap_or(300);
     tracing::info!(%addr, store = "registry", "listening");
     let dyn_store: Arc<dyn hartland::proxy::Store> = store.clone();

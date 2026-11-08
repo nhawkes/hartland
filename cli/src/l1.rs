@@ -10,6 +10,7 @@
 //! Layout:  batches/<envelope hash>.envelope   the signed envelope
 //!          batches/<envelope hash>.bundle     results + referenced blobs
 //!          blobs/<hh>/<hash>                  content-addressed blobs
+//!          outbox/<name>.json                 registry writes still to do
 
 use crate::attest::{Envelope, sha256_hex};
 use crate::jwt::Jwks;
@@ -78,7 +79,7 @@ pub struct L1 {
 
 impl L1 {
     pub async fn open(dir: PathBuf) -> Result<L1, String> {
-        for d in ["batches", "blobs", "tmp"] {
+        for d in ["batches", "blobs", "tmp", "outbox"] {
             tokio::fs::create_dir_all(dir.join(d)).await.map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         Ok(L1 { dir })
@@ -123,6 +124,35 @@ impl L1 {
         self.write_atomic(&b.join(format!("{envelope_hash}.bundle")), bundle).await
     }
 
+    /// Queues a registry plan (opaque JSON) for `hartland promote`.
+    pub async fn write_outbox(&self, plan: &[u8]) -> Result<(), String> {
+        let name = format!("{}.json", sha256_hex(plan));
+        self.write_atomic(&self.dir.join("outbox").join(name), plan).await
+    }
+
+    /// Queued plans, with their paths (remove once done).
+    pub async fn outbox(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let Ok(mut rd) = tokio::fs::read_dir(self.dir.join("outbox")).await else { return out };
+        while let Ok(Some(e)) = rd.next_entry().await {
+            if let Ok(b) = tokio::fs::read(e.path()).await {
+                out.push((e.path(), b));
+            }
+        }
+        out
+    }
+
+    /// Envelope hashes the outbox still refers to (kept by `prune`).
+    async fn outbox_batches(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for (_, b) in self.outbox().await {
+            if let Ok(serde_json::Value::Array(jobs)) = serde_json::from_slice(&b) {
+                out.extend(jobs.iter().filter_map(|j| j.get("envelope")?.as_str().map(str::to_string)));
+            }
+        }
+        out
+    }
+
     /// Every batch that verifies, newest first.
     pub async fn load(&self, jwks: &Jwks, keyring: &Keyring) -> Vec<VerifiedBatch> {
         let mut found = Vec::new();
@@ -152,13 +182,18 @@ impl L1 {
         out
     }
 
-    /// Keeps the newest `keep` batches and the blobs they reference.
+    /// Keeps the newest `keep` batches, any the outbox still needs, and the
+    /// blobs they reference.
     pub async fn prune(&self, keep: usize, jwks: &Jwks, keyring: &Keyring) -> Result<(), String> {
         let batches = self.load(jwks, keyring).await;
+        let queued = self.outbox_batches().await;
         let b = self.dir.join("batches");
         let mut live = HashSet::new();
         let mut kept = HashSet::new();
-        for v in batches.iter().take(keep) {
+        for (i, v) in batches.iter().enumerate() {
+            if i >= keep && !queued.contains(&v.envelope_hash) {
+                continue;
+            }
             kept.insert(v.envelope_hash.clone());
             for (_, _, blobs) in &v.results {
                 live.extend(blobs.iter().cloned());

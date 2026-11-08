@@ -94,6 +94,8 @@ pub struct GhcrStore {
     /// which are written through to the first tier.
     registry_origin: Mutex<HashMap<String, String>>,
     served_remote: Mutex<HashSet<String>>,
+    /// Set once every reader's index has been read (see `load_registry`).
+    registry_loaded: tokio::sync::OnceCell<usize>,
 }
 
 async fn get_blob_retrying(reg: &Registry, hash: &str) -> Result<Vec<u8>, String> {
@@ -132,6 +134,7 @@ impl GhcrStore {
             reused: Mutex::default(),
             registry_origin: Mutex::default(),
             served_remote: Mutex::default(),
+            registry_loaded: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -162,12 +165,31 @@ impl GhcrStore {
     /// Loads the first tier, then every reader's index. Returns the number of
     /// verified results now servable.
     pub async fn load(&self) -> usize {
+        self.load_l1().await;
+        self.load_registry().await
+    }
+
+    /// Loads the first tier only: enough to start serving. The registry
+    /// indexes are needed only on a first-tier miss and when publishing, so
+    /// they can be read in the background (`load_registry`).
+    pub async fn load_l1(&self) -> usize {
         if let Some(l1) = &self.l1 {
             for v in l1.load(&self.jwks, &self.keyring).await {
                 self.accept_batch(v, true);
             }
             tracing::info!(results = lock(&self.indexed).len(), "first tier loaded");
         }
+        lock(&self.indexed).len()
+    }
+
+    /// Reads every reader's index, once; concurrent callers wait for the
+    /// same read. Returns the number of verified results then servable.
+    pub async fn load_registry(&self) -> usize {
+        *self.registry_loaded.get_or_init(|| self.read_indexes()).await
+    }
+
+    async fn read_indexes(&self) -> usize {
+        let started = tokio::time::Instant::now();
         for reg in &self.readers {
             let Ok(reply) = reg.get_manifest(INDEX_TAG).await else { continue };
             if reply.status != 200 {
@@ -203,7 +225,9 @@ impl GhcrStore {
                 .collect::<Vec<()>>()
                 .await;
         }
-        lock(&self.indexed).len()
+        let n = lock(&self.indexed).len();
+        tracing::info!(results = n, elapsed = ?started.elapsed(), "registry indexes loaded");
+        n
     }
 
     /// local -> first tier -> registries (keeping a local copy).
@@ -384,12 +408,16 @@ impl GhcrStore {
         l1.write_batch(env_hash, envelope, &l1::bundle_bytes(entries)?).await
     }
 
-    /// Signs this run's new results as one batch, saves it to the first
-    /// tier, and promotes to the registry per policy. Returns the number of
-    /// new results signed.
+    /// Signs this run's new results as one batch and saves it to the first
+    /// tier, then plans what to send to the registry per policy. With a first
+    /// tier the plan goes to its outbox, for `drain_outbox` (`hartland
+    /// promote`) to push after the build; without one it runs now. Returns
+    /// the number of new results signed.
     pub async fn publish(&self) -> Result<usize, String> {
+        // Promotion and re-indexing compare against the registry indexes.
+        self.load_registry().await;
         let pending: Vec<_> = std::mem::take(&mut *lock(&self.pending));
-        let mut new_batch = None;
+        let mut plan: Vec<Job> = Vec::new();
         if !pending.is_empty() {
             if self.writer.is_none() && self.l1.is_none() {
                 return Err("results pending but nowhere to publish them".to_string());
@@ -412,57 +440,39 @@ impl GhcrStore {
             if self.l1.is_some() {
                 tracing::info!(results = entries.len(), batch = %env_hash, "first tier: saved new results");
             }
-            new_batch = Some((env_hash, envelope, entries));
-        }
-
-        if let Some(writer) = &self.writer {
-            // Registry results served via the slow path: index them.
-            let groups: Vec<(String, HashMap<String, re::ActionResult>)> = std::mem::take(&mut *lock(&self.reindex)).into_iter().collect();
-            for (env_hash, results) in groups {
-                let Some(envelope) = self.local.get_blob(&env_hash).await else { continue };
-                let mut entries = Vec::new();
-                for (a, r) in results {
-                    let blobs = self.referenced_blobs(&r).await?;
-                    entries.push((a, r, blobs));
-                }
-                let bundle = l1::bundle_bytes(&entries)?;
-                let bundle_hash = writer.put_blob(&bundle).await?;
-                self.append_index(writer, (&env_hash, envelope.len()), (&bundle_hash, bundle.len())).await?;
-                tracing::info!(results = entries.len(), batch = %env_hash, "indexed previously signed results");
+            // Keep the results servable from memory (and plannable) like
+            // first-tier ones.
+            for (a, r, _) in &entries {
+                lock(&self.indexed).insert(a.clone(), r.clone());
             }
-
-            if self.promote == Promote::All {
-                if let Some((env_hash, envelope, entries)) = &new_batch {
-                    self.push_batch(writer, env_hash, envelope, entries).await?;
-                }
-            }
-            if self.promote != Promote::None {
-                // First-tier results reused this run, under their own envelopes.
-                let reused: Vec<String> = std::mem::take(&mut *lock(&self.reused)).into_iter().collect();
-                let mut by_env: HashMap<String, Vec<String>> = HashMap::new();
-                let registry = lock(&self.registry_origin).clone();
-                let skipped = reused.iter().filter(|a| registry.contains_key(*a)).count();
-                if skipped > 0 {
-                    tracing::info!(results = skipped, "reused results already in a registry index: not promoted");
-                }
-                for a in reused.into_iter().filter(|a| !registry.contains_key(a)) {
-                    if let Some(env) = lock(&self.l1_origin).get(&a).cloned() {
-                        by_env.entry(env).or_default().push(a);
-                    }
-                }
-                for (env_hash, actions) in by_env {
-                    let Some(envelope) = lock(&self.l1_envelopes).get(&env_hash).cloned() else { continue };
-                    let mut entries = Vec::new();
-                    for a in actions {
-                        let Some(r) = lock(&self.indexed).get(&a).cloned() else { continue };
-                        let blobs = self.referenced_blobs(&r).await?;
-                        entries.push((a, r, blobs));
-                    }
-                    self.push_batch(writer, &env_hash, &envelope, &entries).await?;
-                    tracing::info!(results = entries.len(), batch = %env_hash, "promoted reused results to the registry");
-                }
+            lock(&self.l1_envelopes).insert(env_hash.clone(), envelope);
+            if self.promote == Promote::All || self.l1.is_none() {
+                plan.push(Job { kind: JobKind::Push, envelope: env_hash, actions: entries.into_iter().map(|(a, _, _)| a).collect() });
             }
         }
+
+        // Registry results served via the slow path: index them.
+        for (env_hash, results) in std::mem::take(&mut *lock(&self.reindex)) {
+            plan.push(Job { kind: JobKind::Index, envelope: env_hash, actions: results.into_keys().collect() });
+        }
+        if self.promote != Promote::None {
+            // First-tier results reused this run, under their own envelopes,
+            // unless a registry index already holds them.
+            let reused: Vec<String> = std::mem::take(&mut *lock(&self.reused)).into_iter().collect();
+            let registry = lock(&self.registry_origin).clone();
+            let skipped = reused.iter().filter(|a| registry.contains_key(*a)).count();
+            if skipped > 0 {
+                tracing::info!(results = skipped, "reused results already in a registry index: not promoted");
+            }
+            let mut by_env: HashMap<String, Vec<String>> = HashMap::new();
+            for a in reused.into_iter().filter(|a| !registry.contains_key(a)) {
+                if let Some(env) = lock(&self.l1_origin).get(&a).cloned() {
+                    by_env.entry(env).or_default().push(a);
+                }
+            }
+            plan.extend(by_env.into_iter().map(|(envelope, actions)| Job { kind: JobKind::Push, envelope, actions }));
+        }
+
         // Write registry results served this run through to the first tier,
         // under their own envelopes, so the next run needs no registry reads.
         if self.l1.is_some() {
@@ -476,12 +486,7 @@ impl GhcrStore {
             let (mut batches, mut results) = (0, 0);
             for (env_hash, actions) in by_env {
                 let Some(envelope) = self.local.get_blob(&env_hash).await else { continue };
-                let mut entries = Vec::new();
-                for a in actions {
-                    let Some(r) = lock(&self.indexed).get(&a).cloned() else { continue };
-                    let blobs = self.referenced_blobs(&r).await?;
-                    entries.push((a, r, blobs));
-                }
+                let entries = self.entries(&actions).await?;
                 self.save_l1(&env_hash, &envelope, &entries).await?;
                 batches += 1;
                 results += entries.len();
@@ -490,10 +495,131 @@ impl GhcrStore {
                 tracing::info!(results, batches, "first tier: wrote through registry results");
             }
         }
+
+        match &self.l1 {
+            Some(l1) if !plan.is_empty() => {
+                let n: usize = plan.iter().map(|j| j.actions.len()).sum();
+                l1.write_outbox(&serde_json::to_vec(&plan).map_err(|e| e.to_string())?).await?;
+                tracing::info!(jobs = plan.len(), results = n, "registry promotion queued in the first-tier outbox");
+            }
+            Some(_) => {}
+            None => self.run_plan(merge(plan)).await?,
+        }
         if let Some(l1) = &self.l1 {
             l1.prune(L1_MAX_BATCHES, &self.jwks, &self.keyring).await?;
         }
         Ok(pending.len())
+    }
+
+    /// Pushes every plan in the first-tier outbox to the registry (merged, so
+    /// repeated plans cost nothing extra), removing each once done. Needs a
+    /// writer; call `load_l1` first.
+    pub async fn drain_outbox(&self) -> Result<usize, String> {
+        let Some(l1) = &self.l1 else { return Ok(0) };
+        let mut jobs = Vec::new();
+        let mut files = Vec::new();
+        for (path, bytes) in l1.outbox().await {
+            match serde_json::from_slice::<Vec<Job>>(&bytes) {
+                Ok(j) => jobs.extend(j),
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "unreadable outbox plan: dropped"),
+            }
+            files.push(path);
+        }
+        let jobs = merge(jobs);
+        let n = jobs.iter().map(|j| j.actions.len()).sum();
+        self.run_plan(jobs).await?;
+        for f in files {
+            let _ = tokio::fs::remove_file(f).await;
+        }
+        Ok(n)
+    }
+
+    async fn entries(&self, actions: &[String]) -> Result<Vec<Entry>, String> {
+        let mut entries = Vec::new();
+        for a in actions {
+            let Some(r) = lock(&self.indexed).get(a).cloned() else { continue };
+            let blobs = self.referenced_blobs(&r).await?;
+            entries.push((a.clone(), r, blobs));
+        }
+        Ok(entries)
+    }
+
+    async fn envelope(&self, hash: &str) -> Option<Vec<u8>> {
+        if let Some(e) = lock(&self.l1_envelopes).get(hash).cloned() {
+            return Some(e);
+        }
+        self.local.get_blob(hash).await
+    }
+
+    /// Only results verified (or produced) in this process are sent: plans
+    /// name actions, never carry results, so a tampered outbox can at worst
+    /// re-send verified entries.
+    async fn run_plan(&self, plan: Vec<Job>) -> Result<(), String> {
+        let Some(writer) = &self.writer else { return Ok(()) };
+        for job in plan {
+            let Some(envelope) = self.envelope(&job.envelope).await else {
+                tracing::warn!(batch = %job.envelope, "envelope unavailable: not promoted");
+                continue;
+            };
+            let entries = self.entries(&job.actions).await?;
+            if entries.is_empty() {
+                continue;
+            }
+            match job.kind {
+                JobKind::Push => {
+                    self.push_batch(writer, &job.envelope, &envelope, &entries).await?;
+                    tracing::info!(results = entries.len(), batch = %job.envelope, "pushed to the registry");
+                }
+                JobKind::Index => {
+                    let bundle = l1::bundle_bytes(&entries)?;
+                    let bundle_hash = writer.put_blob(&bundle).await?;
+                    self.append_index(writer, (&job.envelope, envelope.len()), (&bundle_hash, bundle.len())).await?;
+                    tracing::info!(results = entries.len(), batch = %job.envelope, "indexed previously signed results");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum JobKind {
+    Push,
+    Index,
+}
+
+/// One registry write: a batch (by envelope) restricted to some actions.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Job {
+    kind: JobKind,
+    envelope: String,
+    actions: Vec<String>,
+}
+
+/// Unions plans by (kind, envelope). A pushed batch is indexed too, so an
+/// index job covered by a push of the same batch is dropped.
+fn merge(jobs: Vec<Job>) -> Vec<Job> {
+    let mut by: std::collections::BTreeMap<(JobKind, String), BTreeSet<String>> = Default::default();
+    for j in jobs {
+        by.entry((j.kind, j.envelope)).or_default().extend(j.actions);
+    }
+    let pushed: HashSet<String> = by.keys().filter(|(k, _)| *k == JobKind::Push).map(|(_, e)| e.clone()).collect();
+    by.into_iter()
+        .filter(|((k, e), _)| !(*k == JobKind::Index && pushed.contains(e)))
+        .map(|((kind, envelope), a)| Job { kind, envelope, actions: a.into_iter().collect() })
+        .collect()
+}
+
+impl GhcrStore {
+    fn indexed_result(&self, action: &str) -> Option<re::ActionResult> {
+        let r = lock(&self.indexed).get(action).cloned()?;
+        if lock(&self.l1_origin).contains_key(action) {
+            lock(&self.reused).insert(action.to_string());
+        } else if lock(&self.registry_origin).contains_key(action) {
+            lock(&self.served_remote).insert(action.to_string());
+        }
+        Some(r)
     }
 }
 
@@ -524,12 +650,13 @@ impl Store for GhcrStore {
         if let Some(r) = self.local.get_action_result(action).await {
             return Some(r);
         }
-        if let Some(r) = lock(&self.indexed).get(action).cloned() {
-            if lock(&self.l1_origin).contains_key(action) {
-                lock(&self.reused).insert(action.to_string());
-            } else if lock(&self.registry_origin).contains_key(action) {
-                lock(&self.served_remote).insert(action.to_string());
-            }
+        if let Some(r) = self.indexed_result(action) {
+            return Some(r);
+        }
+        // A first-tier miss: wait for the registry indexes (usually already
+        // read in the background), then fall back to per-action lookup.
+        self.load_registry().await;
+        if let Some(r) = self.indexed_result(action) {
             return Some(r);
         }
         for reg in &self.readers {
@@ -544,5 +671,26 @@ impl Store for GhcrStore {
         self.local.put_action_result(action, action_size, result).await?;
         lock(&self.pending).push((action.to_string(), action_size, result.clone()));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn job(kind: JobKind, env: &str, actions: &[&str]) -> Job {
+        Job { kind, envelope: env.into(), actions: actions.iter().map(|a| a.to_string()).collect() }
+    }
+
+    #[test]
+    fn merge_unions_by_batch_and_drops_index_jobs_covered_by_a_push() {
+        let m = merge(vec![
+            job(JobKind::Push, "e1", &["a", "b"]),
+            job(JobKind::Push, "e1", &["b", "c"]),
+            job(JobKind::Index, "e1", &["a"]),
+            job(JobKind::Index, "e2", &["x"]),
+        ]);
+        let got: Vec<_> = m.iter().map(|j| (j.kind, j.envelope.as_str(), j.actions.clone())).collect();
+        assert_eq!(got, vec![(JobKind::Push, "e1", vec!["a".into(), "b".into(), "c".into()]), (JobKind::Index, "e2", vec!["x".into()])]);
     }
 }
