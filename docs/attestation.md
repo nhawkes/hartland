@@ -137,6 +137,16 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
 
 ## Settled
 
+- Package attestations (hartland-packages run 42492602972, builder
+  1bc0a13): one statement per target, subjects = output files by sha256,
+  predicate = target, repository, commit; verification requires repository
+  and commit to equal the token's own `repository`/`sha` claims. Verified
+  locally against the run's `hello` binary; a one-byte-modified binary and a
+  cross-package check were rejected.
+- Trust across builder versions: builder 1bc0a13 trusted ca0821d via
+  `keys/builders.json`, so its first build was 100% cache hits served from
+  entries the previous builder had signed.
+
 - Attested build end to end (hartland-packages run 42488633099):
   hartland-packages' `attested.yml` called `nhawkes/hartland/.github/
   workflows/build.yml@ca0821d`. The builder read its own commit from its
