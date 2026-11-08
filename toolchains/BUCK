@@ -1,4 +1,4 @@
 export_file(
-    name = "zig-flatten.sh",
+    name = "zig_wrap.zig",
     visibility = ["PUBLIC"],
 )

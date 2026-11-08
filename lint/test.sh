@@ -11,7 +11,11 @@ for want in \
     "fixtures:sha1-and-sha256: sha1 pins are not allowed" \
     "fixtures:fetches: genrule cmd calls network fetcher(s): curl" \
     "fixtures:clones: genrule bash calls network fetcher(s): git" \
-    "fixtures:net-prop: attribute exec_properties sets exec property dockerNetwork"; do
+    "fixtures:net-prop: attribute exec_properties sets exec property dockerNetwork" \
+    "fixtures:sh-fetches: genrule cmd calls network fetcher(s): wget" \
+    "fixtures:fetches: prelude genrule runs host tools; use sh_genrule" \
+    "fixtures:no-sha256: prelude http_archive runs host tools; use pinned_archive" \
+    "fixtures:sha1-and-sha256: prelude http_file runs host tools; use pinned_file"; do
     grep -qF "$want" <<<"$out" || { echo "FAIL: missing: $want"; fail=1; }
 done
 if grep -q "ok-gitignore" <<<"$out"; then echo "FAIL: false positive on ok-gitignore"; fail=1; fi

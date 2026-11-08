@@ -1,3 +1,4 @@
+load("@hartland//rules:sh.bzl", "sh_genrule")
 load(":defs.bzl", "props_rule")
 
 # Deliberately bad targets: the lint must reject every one of these.
@@ -35,9 +36,15 @@ props_rule(
     exec_properties = {"dockerNetwork": "bridge"},
 )
 
-# Must NOT be flagged: "git" only as part of a longer word / path.
-genrule(
+# Must NOT be flagged: hartland's own rule, and "git" only inside a longer word.
+sh_genrule(
     name = "ok-gitignore",
     out = "w",
     cmd = "cp $SRCDIR/.gitignore-like $OUT || touch $OUT",
+)
+
+sh_genrule(
+    name = "sh-fetches",
+    out = "v",
+    cmd = "wget -O $OUT https://example.invalid",
 )

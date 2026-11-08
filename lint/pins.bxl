@@ -4,6 +4,8 @@
     buck2 bxl hartland//lint/pins.bxl:lint -- --pattern 'root//foo/...'
 
 Fails (non-zero exit) when any target:
+  * uses a prelude rule that runs host tools (genrule needs the host's bash,
+    http_archive the host's sh and tar); use sh_genrule / pinned_archive;
   * downloads (http_archive / http_file / remote_file) without a sha256, or with a sha1;
   * runs a genrule whose command calls a network fetcher (curl, wget, git, ...);
   * sets a network-related execution property in its attributes. The only
@@ -11,7 +13,15 @@ Fails (non-zero exit) when any target:
     which pins network off in code rather than in attributes.
 """
 
-_DOWNLOAD_RULES = ["http_archive", "http_file", "remote_file"]
+_DOWNLOAD_RULES = ["http_archive", "http_file", "remote_file", "_pinned_archive", "_pinned_file"]
+
+# Prelude rules that reach for host binaries, and the hermetic replacement.
+_BANNED_PRELUDE = {
+    "genrule": "sh_genrule (hartland//rules:sh.bzl)",
+    "http_archive": "pinned_archive (hartland//rules:pinned.bzl)",
+    "http_file": "pinned_file (hartland//rules:pinned.bzl)",
+    "remote_file": "pinned_file (hartland//rules:pinned.bzl)",
+}
 _GENRULE_CMD_ATTRS = ["cmd", "bash", "cmd_exe"]
 _FETCHERS = ["curl", "wget", "git", "fetch", "aria2c", "rsync", "scp", "ssh", "nc", "pip", "npm"]
 _NETWORK_KEYS = ["dockerNetwork", "network", "Network"]
@@ -81,6 +91,8 @@ def _impl(ctx):
     for t in targets:
         n += 1
         r = _rule_name(t)
+        if t.rule_type.startswith("prelude//") and r in _BANNED_PRELUDE:
+            errs.append("{}: prelude {} runs host tools; use {}".format(t.label, r, _BANNED_PRELUDE[r]))
         if r in _DOWNLOAD_RULES:
             _check_download(t, errs)
         if r == "genrule" or r.endswith("_genrule"):
