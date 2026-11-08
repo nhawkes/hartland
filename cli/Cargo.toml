@@ -22,3 +22,6 @@ tonic-prost = "0.14.9"
 [build-dependencies]
 protox = "0.10.0"
 tonic-prost-build = "0.14.9"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }

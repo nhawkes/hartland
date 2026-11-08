@@ -31,20 +31,80 @@ const ATTEMPTS: u32 = 8;
 
 /// No pacing on our side: requests go as fast as callers send them. When the
 /// registry answers 429 it says how long to wait (GHCR: "retry-after: 17ms"
-/// in the body, allowed 2000/minute); the waiter sleeps exactly that while
-/// holding this gate, and every request passes the gate before sending, so
-/// nothing new goes out meanwhile and sleeps never overlap.
-static GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-async fn wait_at_gate() {
-    drop(GATE.lock().await);
+/// in the body, allowed 2000/minute). The first request to see it takes this
+/// gate, sleeps exactly that, and resends while still holding it; the gate
+/// reopens only when a reply comes back that is not a 429. Every request
+/// passes the gate before sending, so nothing else goes out meanwhile, sleeps
+/// never overlap, and the queue is released by one clean probe rather than a
+/// herd. Requests whose 429 predates the reopening just go again.
+pub struct Gate {
+    /// When the gate last reopened after a clean probe.
+    reopened: tokio::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
-/// Sleeps out the rest of a 429's retry-after under the gate. Time already
-/// spent waiting for the gate counts, so concurrent 429s do not stack.
-async fn back_off(received: tokio::time::Instant, wait: std::time::Duration) {
-    let _held = GATE.lock().await;
-    tokio::time::sleep_until(received + wait).await;
+type Held = tokio::sync::MutexGuard<'static, Option<tokio::time::Instant>>;
+
+impl Gate {
+    pub const fn new() -> Gate {
+        Gate { reopened: tokio::sync::Mutex::const_new(None) }
+    }
+}
+
+static GATE: Gate = Gate::new();
+
+/// A reply plus when it arrived; `Err` is a transport failure.
+type Sent = Result<(Reply, tokio::time::Instant), String>;
+
+/// Sends with `send`, retrying 429 through the gate, 5xx and transport errors
+/// with exponential backoff.
+async fn retrying<F, Fut>(gate: &'static Gate, send: F) -> Result<Reply, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Sent>,
+{
+    let mut last = String::new();
+    let mut held: Option<Held> = None;
+    let reopen = |held: &mut Option<Held>| {
+        if let Some(mut g) = held.take() {
+            *g = Some(tokio::time::Instant::now());
+        }
+    };
+    for attempt in 0..ATTEMPTS {
+        if held.is_none() {
+            drop(gate.reopened.lock().await);
+        }
+        let backoff = std::time::Duration::from_millis(100 << attempt.min(6));
+        match send().await {
+            Ok((r, received)) if r.status == 429 => {
+                last = format!("429 {}", String::from_utf8_lossy(&r.body));
+                let g = match held.take() {
+                    Some(g) => g,
+                    None => gate.reopened.lock().await,
+                };
+                if g.is_some_and(|t| t > received) {
+                    continue; // another request's probe came back clean since
+                }
+                tokio::time::sleep_until(received + retry_after(&r).unwrap_or(backoff)).await;
+                held = Some(g); // probe while holding
+            }
+            Ok((r, _)) => {
+                reopen(&mut held);
+                if (500..600).contains(&r.status) {
+                    last = format!("{} {}", r.status, String::from_utf8_lossy(&r.body));
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Ok(r);
+            }
+            Err(e) => {
+                // No reply: a held gate stays held for the next probe.
+                last = e;
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+    reopen(&mut held);
+    Err(format!("giving up after {ATTEMPTS} attempts: {last}"))
 }
 
 fn retry_after(r: &Reply) -> Option<std::time::Duration> {
@@ -60,40 +120,17 @@ fn retry_after(r: &Reply) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs_f64(if unit.starts_with("ms") { n / 1000.0 } else { n }))
 }
 
-/// Sends, retrying 429 (sleeping what the registry asks, under the gate),
-/// 5xx and transport errors (exponential backoff). `make` builds a fresh
-/// request each try.
+/// `make` builds a fresh request each try.
 async fn reply_with(make: impl Fn() -> reqwest::RequestBuilder) -> Result<Reply, String> {
-    let mut last = String::new();
-    for attempt in 0..ATTEMPTS {
-        wait_at_gate().await;
-        let backoff = std::time::Duration::from_millis(100 << attempt.min(6));
-        match make().send().await {
-            Ok(resp) => {
-                let received = tokio::time::Instant::now();
-                let status = resp.status().as_u16();
-                let headers = resp.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
-                let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
-                let r = Reply { status, body, headers };
-                if status == 429 {
-                    last = format!("429 {}", String::from_utf8_lossy(&r.body));
-                    back_off(received, retry_after(&r).unwrap_or(backoff)).await;
-                    continue;
-                }
-                if (500..600).contains(&status) {
-                    last = format!("{status} {}", String::from_utf8_lossy(&r.body));
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                return Ok(r);
-            }
-            Err(e) => {
-                last = e.to_string();
-                tokio::time::sleep(backoff).await;
-            }
-        }
-    }
-    Err(format!("giving up after {ATTEMPTS} attempts: {last}"))
+    retrying(&GATE, || async {
+        let resp = make().send().await.map_err(|e| e.to_string())?;
+        let received = tokio::time::Instant::now();
+        let status = resp.status().as_u16();
+        let headers = resp.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
+        let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+        Ok((Reply { status, body, headers }, received))
+    })
+    .await
 }
 
 impl Registry {
@@ -234,23 +271,50 @@ mod tests {
         assert!(d > std::time::Duration::from_millis(17) && d < std::time::Duration::from_millis(18));
     }
 
-    #[tokio::test]
-    async fn concurrent_429s_do_not_stack_and_block_new_requests() {
-        let wait = std::time::Duration::from_millis(80);
+    /// A fake registry: 429 ("retry-after: 50ms") until `open_at`, then 200.
+    /// Records when each request was sent.
+    struct Fake {
+        open_at: tokio::time::Instant,
+        sent: std::sync::Mutex<Vec<(tokio::time::Instant, u16)>>,
+    }
+
+    impl Fake {
+        async fn send(&self) -> Sent {
+            let now = tokio::time::Instant::now();
+            let status = if now >= self.open_at { 200 } else { 429 };
+            self.sent.lock().unwrap().push((now, status));
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            Ok((Reply { status, body: b"retry-after: 50ms".to_vec(), headers: vec![] }, tokio::time::Instant::now()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_probe_at_a_time_and_no_herd() {
+        static G: Gate = Gate::new();
         let start = tokio::time::Instant::now();
-        // Two 429s received at the same moment, then a new request.
-        let a = tokio::spawn(back_off(start, wait));
-        let b = tokio::spawn(back_off(start, wait));
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let c = tokio::spawn(async move {
-            wait_at_gate().await;
-            tokio::time::Instant::now()
-        });
-        let (_, _, sent) = (a.await.unwrap(), b.await.unwrap(), c.await.unwrap());
-        let total = start.elapsed();
-        assert!(total >= wait, "slept less than requested: {total:?}");
-        assert!(total < wait * 2, "sleeps stacked: {total:?}");
-        assert!(sent - start >= wait, "a new request went out during the back-off");
+        // Rate-limited for 120 ms: needs three 50 ms back-offs to clear.
+        let fake = std::sync::Arc::new(Fake { open_at: start + std::time::Duration::from_millis(120), sent: Default::default() });
+        let tasks: Vec<_> = (0..10)
+            .map(|_| {
+                let f = fake.clone();
+                tokio::spawn(async move { retrying(&G, || f.send()).await })
+            })
+            .collect();
+        for t in tasks {
+            assert_eq!(t.await.unwrap().unwrap().status, 200);
+        }
+        let sent = fake.sent.lock().unwrap().clone();
+        let first_ok = sent.iter().find(|(_, s)| *s == 200).unwrap().0;
+        let before: Vec<_> = sent.iter().filter(|(t, _)| *t < first_ok).collect();
+        // The initial burst of 10, then one probe per back-off: no herd.
+        assert!(before.len() <= 10 + 3, "herd while rate-limited: {} requests before the first 200", before.len());
+        // Probes were spaced by the requested sleep: never overlapping.
+        let probes: Vec<_> = before.iter().skip(10).map(|(t, _)| *t).collect();
+        for w in probes.windows(2) {
+            assert!(w[1] - w[0] >= std::time::Duration::from_millis(50), "sleeps overlapped: {probes:?}");
+        }
+        // Nothing failed after the gate reopened.
+        assert!(sent.iter().all(|(t, s)| *t < first_ok || *s == 200));
     }
 
     #[test]

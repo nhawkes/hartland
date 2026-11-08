@@ -145,7 +145,9 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
   hello-own-musl and the libc smoke test (run as a sandboxed build action).
 - GHCR rate limit: 2000 requests/minute, answered with 429 TOOMANYREQUESTS
   and `retry-after` in the body. An earlier run lost 284 manifests to it;
-  the client now paces at 30 requests/s and retries.
+  the client does not pace itself: the first request to see a 429 holds an
+  async gate, sleeps the requested time and resends; the gate reopens only
+  when that probe comes back clean, so waiting requests never herd.
 - Batch index (builder 713f2b5): phase 1 served all 1364 results via
   per-action lookup (13 min at 30 requests/s) and indexed them under their
   original envelopes; phase 2 loaded 1364 verified results from the index
