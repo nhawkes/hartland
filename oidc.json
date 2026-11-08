@@ -1,0 +1,35 @@
+{
+  "alg": "RS256",
+  "kid": "38826b17-6a30-5f9b-b169-8beb8202f723",
+  "token_length": 2004,
+  "verified": true,
+  "claims": {
+    "aud": "hartland-attest:sha256:9862a8d3b7678cd06054228088deec0179e17521d558ce5f5ae1dc93e7271db7",
+    "iss": "https://token.actions.githubusercontent.com",
+    "sub": "repo:nhawkes@8300052/hartland@1449794659:ref:refs/heads/spike/oidc",
+    "repository": "nhawkes/hartland",
+    "repository_owner": "nhawkes",
+    "repository_visibility": "private",
+    "ref": "refs/heads/spike/oidc",
+    "sha": "8cf622e2e7dfaad7a1d7a08e12037a801c8fa8dc",
+    "workflow_ref": "nhawkes/hartland/.github/workflows/spike-oidc.yml@refs/heads/spike/oidc",
+    "workflow_sha": "8cf622e2e7dfaad7a1d7a08e12037a801c8fa8dc",
+    "job_workflow_ref": "nhawkes/hartland/.github/workflows/spike-oidc.yml@refs/heads/spike/oidc",
+    "job_workflow_sha": "8cf622e2e7dfaad7a1d7a08e12037a801c8fa8dc",
+    "runner_environment": "github-hosted",
+    "event_name": "push",
+    "run_id": "42482303706",
+    "run_attempt": "1"
+  },
+  "lifetime_seconds": 300,
+  "nbf_offset": -300,
+  "wrong_audience_rejected": true,
+  "sig_valid_ignoring_exp": true,
+  "jwks_kids": [
+    "cc413527-173f-5a05-976e-9c52b1d7b431",
+    "38826b17-6a30-5f9b-b169-8beb8202f723",
+    "38E9B30B3A023A1B72309921A69A42FCC496C42C",
+    "4F3E9AD8C9A6F5EB3173006F4FA630E28F43DCE9"
+  ]
+}
+exit=0
