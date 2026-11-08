@@ -114,6 +114,18 @@ It dispatched the worker run (`workflow_dispatch` with `GITHUB_TOKEN` and
   `.buckconfig`; it is a platform property, so it changes every action
   digest and nothing else.
 
+## Results
+
+- Run on builder 67714f5 (musl, 1,365 actions, cache seed bumped): 4
+  workers joined 15-40 s after dispatch and ran 580 actions, but phase 1
+  took 7 m 40 s against ~5 m alone. Workers pulled ~19k input files each
+  while still relayed, and n0's relay rate-limited the coordinator.
+- Run on builder 03b4d3c (libc-test, 1,122 new actions; musl cached): 4
+  workers joined 8-17 s after dispatch, all on direct paths (RTT 2-60 ms),
+  after waiting for a direct path before taking work. Coordinator 678
+  actions, workers 444; phase 1 in 1 m 54 s. All worker batches accepted;
+  fresh-proxy rebuild 100% (2,480/2,480).
+
 ## Open
 
 - Several streams per worker for input transfer, if 23 MB/s per stream is
