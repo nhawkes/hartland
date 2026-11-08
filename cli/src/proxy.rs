@@ -53,6 +53,8 @@ pub enum StoreError {
     Unavailable(Sha256),
     #[error("results pending but nowhere to publish them")]
     Nowhere,
+    #[error("refused: {0}")]
+    Refused(String),
 }
 
 #[async_trait::async_trait]
@@ -66,6 +68,25 @@ pub trait Store: Send + Sync + 'static {
         action: ActionDigest,
         result: &re::ActionResult,
     ) -> Result<(), StoreError>;
+
+    /// A result a worker executed for this build: usable now, but signed by
+    /// the worker (in its batch), never by this store's owner.
+    async fn put_worker_result(
+        &self,
+        action: ActionDigest,
+        result: &re::ActionResult,
+    ) -> Result<(), StoreError> {
+        self.put_action_result(action, result).await
+    }
+
+    /// A worker's signed batch. Stores that publish nothing ignore it.
+    async fn accept_worker_batch(
+        &self,
+        _envelope: bytes::Bytes,
+        _worker: &crate::cert::PublicKey,
+    ) -> Result<usize, StoreError> {
+        Ok(0)
+    }
 }
 
 /// Blobs and action results on local disk.
@@ -178,8 +199,12 @@ pub struct Proxy {
     /// client UpdateActionResult: only results of actions it ran itself may
     /// be vouched for.
     executor: Option<Arc<crate::execute::Executor>>,
-    /// Bounds concurrent executions (buck2 submits hundreds at once).
+    /// Bounds concurrent local executions (buck2 submits hundreds at once).
     exec_slots: Arc<tokio::sync::Semaphore>,
+    /// Workers to hand actions to, when scaled out.
+    pool: Option<Arc<crate::worker::Pool>>,
+    /// Actions waiting for a local or worker slot (the demand for workers).
+    queued: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Proxy {
@@ -189,6 +214,88 @@ impl Proxy {
             store,
             executor: None,
             exec_slots: Arc::new(tokio::sync::Semaphore::new(cpus)),
+            pool: None,
+            queued: Arc::default(),
+        }
+    }
+
+    /// Hands actions to workers as well as running them locally.
+    pub fn with_pool(self, pool: Arc<crate::worker::Pool>) -> Proxy {
+        Proxy {
+            pool: Some(pool),
+            ..self
+        }
+    }
+
+    /// Actions waiting for an execution slot right now.
+    pub fn queued(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.queued.clone()
+    }
+
+    /// Runs an action on whichever is free first: a local slot or a worker.
+    /// A worker that fails is not retried there; the action runs locally.
+    async fn run(
+        &self,
+        executor: &crate::execute::Executor,
+        action: ActionDigest,
+    ) -> Result<re::ActionResult, String> {
+        use std::sync::atomic::Ordering;
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        let place = loop {
+            if let Ok(local) = self.exec_slots.clone().try_acquire_owned() {
+                break Ok(local);
+            }
+            if let Some(slot) = self.pool.as_ref().and_then(crate::worker::Pool::reserve) {
+                break Err(slot);
+            }
+            match &self.pool {
+                Some(pool) => {
+                    tokio::select! {
+                        p = self.exec_slots.clone().acquire_owned() => break Ok(p.map_err(|e| e.to_string())?),
+                        () = pool.changed() => {}
+                    }
+                }
+                None => {
+                    break Ok(self
+                        .exec_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| e.to_string())?);
+                }
+            }
+        };
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+        match place {
+            Ok(_local) => executor.execute(action).await.map_err(|e| e.to_string()),
+            Err(slot) => {
+                let pool = self
+                    .pool
+                    .as_ref()
+                    .expect("a worker slot comes from the pool");
+                match pool.execute(&slot, action).await {
+                    Ok((r, cacheable)) if crate::proxy::outputs_present(&*self.store, &r).await => {
+                        if cacheable {
+                            self.store
+                                .put_worker_result(action, &r)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+                        Ok(r)
+                    }
+                    outcome => {
+                        tracing::warn!(action = %action.id, ?outcome, "worker execution failed; running locally");
+                        drop(slot);
+                        let _local = self
+                            .exec_slots
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        executor.execute(action).await.map_err(|e| e.to_string())
+                    }
+                }
+            }
         }
     }
 
@@ -539,20 +646,14 @@ impl re::execution_server::Execution for Proxy {
                 ..Default::default()
             }
         } else {
-            let _slot = self
-                .exec_slots
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            match executor.execute(action).await {
+            match self.run(&executor, action).await {
                 Ok(r) => re::ExecuteResponse {
                     result: Some(r),
                     status: ok_status(),
                     ..Default::default()
                 },
                 Err(e) => re::ExecuteResponse {
-                    status: rpc_status(tonic::Code::Internal, e.to_string()),
+                    status: rpc_status(tonic::Code::Internal, e),
                     ..Default::default()
                 },
             }

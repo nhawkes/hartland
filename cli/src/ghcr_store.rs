@@ -876,6 +876,62 @@ impl Store for GhcrStore {
         });
         Ok(())
     }
+
+    async fn put_worker_result(
+        &self,
+        action: ActionDigest,
+        result: &re::ActionResult,
+    ) -> Result<(), StoreError> {
+        // Not ours to sign: it is published with the worker's batch.
+        self.local.put_action_result(action, result).await
+    }
+
+    /// Keeps the results the batch vouches for that we hold (from this
+    /// worker's executions), as built in this run.
+    async fn accept_worker_batch(
+        &self,
+        envelope: Bytes,
+        worker: &crate::cert::PublicKey,
+    ) -> Result<usize, StoreError> {
+        let batch: Batch = Envelope::parse(&envelope)
+            .and_then(|e| e.verify(&self.jwks, &self.keyring))
+            .map_err(|e| StoreError::Refused(format!("batch from worker {worker}: {e}")))?
+            .statement;
+        let id = BatchId(Sha256::of(&envelope));
+        let mut results = Vec::new();
+        for action in batch.results.keys() {
+            let Some(r) = self.local.get_action_result(action).await else {
+                continue;
+            };
+            if !batch.vouches(action, &r.encode_to_vec()) {
+                continue;
+            }
+            let blobs = self.referenced_blobs(&r).await?;
+            results.push(CachedResult {
+                action: *action,
+                result: r,
+                blobs,
+            });
+        }
+        if let Some(l1) = &self.l1 {
+            self.save_first_tier(l1, id, envelope.clone(), &results)
+                .await?;
+        }
+        self.envelopes.pin().insert(id, envelope);
+        let known = self.known.pin();
+        let n = results.len();
+        for r in results {
+            let origin = Origin {
+                batch: id,
+                built_here: true,
+                in_first_tier: self.l1.is_some(),
+                in_registry: InRegistry::No,
+                used: false,
+            };
+            known.insert(r.action, Known::new(r, origin));
+        }
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
