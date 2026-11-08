@@ -1,0 +1,45 @@
+# Spike: called from another repository. Does the OIDC token name THIS
+# workflow in job_workflow_ref? Self-contained: the caller's token cannot read
+# this private repository's files. Results go to the caller's repository.
+name: spike-reusable
+on:
+  workflow_call: {}
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Token claims
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          python3 -m pip install -q --user 'pyjwt[crypto]==2.10.1' >/dev/null 2>&1
+          aud="hartland-attest:sha256:$(printf 'hartland reusable spike' | sha256sum | cut -d' ' -f1)"
+          enc="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$aud")"
+          cat > verify.py <<'PY'
+          import json, sys, jwt
+          aud = sys.argv[1]
+          tok = json.load(sys.stdin)["value"]
+          iss = "https://token.actions.githubusercontent.com"
+          key = jwt.PyJWKClient(iss + "/.well-known/jwks").get_signing_key_from_jwt(tok)
+          c = jwt.decode(tok, key.key, algorithms=["RS256"], audience=aud, issuer=iss)
+          keep = ["aud", "sub", "repository", "ref", "sha", "workflow_ref", "workflow_sha",
+                  "job_workflow_ref", "job_workflow_sha", "runner_environment", "event_name", "run_id"]
+          print(json.dumps({"verified": True, "claims": {k: c.get(k) for k in keep}}, indent=2))
+          PY
+          curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$enc" \
+            | python3 verify.py "$aud" > results/reusable.json 2>&1
+          echo "exit=$?" >> results/reusable.json
+      - name: Publish results to the caller
+        if: always()
+        shell: bash
+        run: |
+          cd results
+          git init -q && git checkout -q -b results
+          git -c user.name=spike -c user.email=spike@invalid add -A
+          git -c user.name=spike -c user.email=spike@invalid commit -qm "reusable spike results (run $GITHUB_RUN_ID)"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" HEAD:refs/heads/spike/reusable-results
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
