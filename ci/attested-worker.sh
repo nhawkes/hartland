@@ -15,8 +15,10 @@ hl="$(realpath "$1")"
 builder="nhawkes/hartland/.github/workflows/build.yml"
 echo "worker: builder $builder@$BUILDER_SHA for coordinator $COORDINATOR (run $COORDINATOR_RUN)" >&2
 
-(cd "$hl/cli" && cargo build --locked --release -q)
 hartland="$hl/cli/target/release/hartland"
+# Present only if ci/verify-binary.py accepted the coordinator's certified
+# build; otherwise compile from source here.
+[ -x "$hartland" ] || (cd "$hl/cli" && cargo build --locked --release -q)
 work="$(mktemp -d)"
 python3 "$hl/ci/make-keyring.py" "$builder" "$BUILDER_SHA" "$hl/keys/builders.json" > "$work/keyring.json"
 

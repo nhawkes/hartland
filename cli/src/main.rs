@@ -550,7 +550,7 @@ async fn scale_out(
     store: Arc<dyn Store>,
     keyring: Keyring,
     jwks: Jwks,
-) -> anyhow::Result<(Proxy, Option<Arc<hartland::worker::Pool>>)> {
+) -> anyhow::Result<(Proxy, Option<(Arc<hartland::worker::Pool>, iroh::Endpoint)>)> {
     let Some(workflow) = &scale.worker_workflow else {
         return Ok((proxy, None));
     };
@@ -565,7 +565,7 @@ async fn scale_out(
     let ep = hartland::worker::bind(&identity, hartland::worker::Network::N0).await?;
     let key = identity.public();
     let pool = hartland::worker::Pool::new(identity, trust, store);
-    tokio::spawn(pool.clone().serve(ep));
+    tokio::spawn(pool.clone().serve(ep.clone()));
     let proxy = proxy.with_pool(pool.clone());
     let dispatcher = hartland::dispatch::Dispatcher {
         repository,
@@ -582,7 +582,7 @@ async fn scale_out(
     };
     tokio::spawn(dispatcher.run(pool.clone(), proxy.queued()));
     tracing::info!(coordinator = %key, max_workers = scale.max_workers, "scale-out enabled");
-    Ok((proxy, Some(pool)))
+    Ok((proxy, Some((pool, ep))))
 }
 
 fn registry_credentials() -> Option<(String, String)> {
@@ -772,7 +772,8 @@ async fn serve_registry(
         jwks: registry.jwks.clone().context("--jwks is required")?,
     };
     let (keyring, jwks) = trust.load().await?;
-    let (proxy, pool) = scale_out(scale, proxy, dyn_store, keyring, jwks).await?;
+    let (proxy, scaled) = scale_out(scale, proxy, dyn_store, keyring, jwks).await?;
+    let pool = scaled.as_ref().map(|(p, _)| p.clone());
     let serve = proxy.serve(listen);
     // Workers' results are signed by the workers: collect their batches
     // before every publish.
@@ -803,6 +804,9 @@ async fn serve_registry(
     }
     tracing::info!("shutting down; publishing pending results");
     publish(store, pool).await;
+    if let Some((_, ep)) = scaled {
+        ep.close().await;
+    }
     Ok(())
 }
 

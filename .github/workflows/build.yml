@@ -77,6 +77,28 @@ jobs:
           git -c http.extraheader="$auth" submodule update -q --init --depth 1
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      # Workers run the CLI this job compiles, so they need not compile it.
+      # The Actions cache is untrusted, so the binary travels with a token
+      # whose audience is its digest; workers check it (ci/verify-binary.py)
+      # before running it.
+      - name: Build and certify the hartland CLI
+        if: inputs.max_workers > 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd hl/cli && cargo build --locked --release -q)
+          bin="$RUNNER_TEMP/hartland-bin" && mkdir -p "$bin" && cp hl/cli/target/release/hartland "$bin/"
+          digest="$(sha256sum "$bin/hartland" | cut -d' ' -f1)"
+          curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=hartland-binary:sha256:$digest" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])' > "$bin/token"
+          echo "hartland CLI sha256:$digest"
+      - name: Cache the certified CLI for workers
+        if: inputs.max_workers > 0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/hartland-bin
+          key: hartland-bin-${{ steps.self.outputs.sha }}-${{ github.run_id }}
       # First cache tier: signed batches and their blobs in GitHub's Actions
       # cache (untrusted transport: verified on load like everything else).
       - name: Restore first-tier cache
@@ -136,6 +158,21 @@ jobs:
           git init -q hl && cd hl
           git fetch -q --depth 1 https://github.com/nhawkes/hartland "${{ steps.self.outputs.sha }}"
           git checkout -q FETCH_HEAD
+      - name: Restore the coordinator's CLI
+        id: bin
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/hartland-bin
+          key: hartland-bin-${{ steps.self.outputs.sha }}-${{ inputs.coordinator_run }}
+      - name: Check it is the builder's own (else compile from source)
+        if: steps.bin.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          bin="$RUNNER_TEMP/hartland-bin"
+          if python3 hl/ci/verify-binary.py hl/keys/github-actions-jwks.json "$bin/token" "$bin/hartland" \
+              nhawkes/hartland/.github/workflows/build.yml "${{ steps.self.outputs.sha }}" "$GITHUB_REPOSITORY"; then
+            mkdir -p hl/cli/target/release && cp "$bin/hartland" hl/cli/target/release/hartland
+          fi
       - name: Work
         shell: bash
         run: bash hl/ci/attested-worker.sh hl
