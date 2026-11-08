@@ -27,6 +27,17 @@ jobs:
           mkdir -p results
           cp src/spikes/attest/sample-results.json results/
           src/cli/target/release/hartland attest sign --results results/sample-results.json --out results/envelope.json
+      - name: Sandbox probe as the sandbox user
+        run: |
+          mkdir -p sb/in sb/collect
+          gcc -static -O2 -o sb/in/probe src/cli/tests/probe/probe.c
+          echo hi > sb/in/input.txt
+          src/cli/target/release/hartland sandbox setup
+          src/cli/target/release/hartland sandbox run --input sb/in --collect sb/collect \
+            --output out/report.txt --env HARTLAND_TEST=yes -- /work/probe
+          cp sb/collect/out/report.txt results/sandbox-report.txt
+          echo "worker_sees_token_request=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && echo yes || echo no)" >> results/sandbox-report.txt
+          ls -A /tmp | grep -c '^hartland-action-' | sed 's/^/leftover_scratch_dirs=/' >> results/sandbox-report.txt || true
       - name: Publish results
         if: always()
         run: |
