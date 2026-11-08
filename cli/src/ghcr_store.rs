@@ -89,7 +89,43 @@ impl GhcrStore {
             return None;
         }
         let bytes = get_blob_retrying(reg, config_hash).ok()?;
-        re::ActionResult::decode(bytes.as_slice()).ok()
+        let result = re::ActionResult::decode(bytes.as_slice()).ok()?;
+        // Fetch everything the result needs now (in parallel), so existence
+        // checks can stay local and buck2 never waits on registry HEADs.
+        if self.prefetch(&result) { Some(result) } else { None }
+    }
+
+    /// Downloads a verified result's blobs into the local store.
+    fn prefetch(&self, r: &re::ActionResult) -> bool {
+        let mut first: Vec<String> = r.output_files.iter().filter_map(|f| f.digest.as_ref().map(|d| d.hash.clone())).collect();
+        first.extend(r.stdout_digest.iter().chain(r.stderr_digest.iter()).map(|d| d.hash.clone()));
+        let trees: Vec<String> = r.output_directories.iter().filter_map(|d| d.tree_digest.as_ref().map(|t| t.hash.clone())).collect();
+        first.extend(trees.iter().cloned());
+        if !self.fetch_all(&first) {
+            return false;
+        }
+        let mut second = Vec::new();
+        for t in &trees {
+            let Some(bytes) = self.local.get_blob(t) else { return false };
+            let Ok(tree) = re::Tree::decode(bytes.as_slice()) else { return false };
+            for d in tree.root.iter().chain(tree.children.iter()) {
+                second.extend(d.files.iter().filter_map(|f| f.digest.as_ref().map(|d| d.hash.clone())));
+            }
+        }
+        self.fetch_all(&second)
+    }
+
+    fn fetch_all(&self, hashes: &[String]) -> bool {
+        let missing: Vec<&String> = hashes.iter().filter(|h| !self.local.has_blob(h)).collect();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..UPLOAD_PARALLELISM.min(missing.len().max(1)))
+                .map(|t| {
+                    let missing = &missing;
+                    s.spawn(move || missing.iter().skip(t).step_by(UPLOAD_PARALLELISM).all(|h| self.fetch_blob(h).is_some()))
+                })
+                .collect();
+            handles.into_iter().all(|h| h.join().unwrap_or(false))
+        })
     }
 
     /// Signs everything written this run as one batch and pushes it.
@@ -131,6 +167,7 @@ impl GhcrStore {
             writer.put_blob(config)?;
         }
 
+        let mut manifests = Vec::new();
         for (((action, _, _), config), refs) in pending.iter().zip(&configs).zip(&referenced) {
             let config_hash = sha256_hex(config);
             let mut layers = Vec::new();
@@ -146,7 +183,27 @@ impl GhcrStore {
                 "layers": layers,
                 "annotations": {ANN_ENVELOPE: format!("sha256:{env_hash}")},
             });
-            writer.put_manifest(action, MANIFEST_MEDIA_TYPE, &serde_json::to_vec(&manifest).map_err(|e| e.to_string())?)?;
+            manifests.push((action.clone(), serde_json::to_vec(&manifest).map_err(|e| e.to_string())?));
+        }
+        // Manifests in parallel too (~0.3 s each sequentially).
+        let errors: Vec<String> = std::thread::scope(|s| {
+            let manifests = &manifests;
+            let handles: Vec<_> = (0..UPLOAD_PARALLELISM.min(manifests.len().max(1)))
+                .map(|t| {
+                    s.spawn(move || {
+                        manifests
+                            .iter()
+                            .skip(t)
+                            .step_by(UPLOAD_PARALLELISM)
+                            .filter_map(|(a, m)| writer.put_manifest(a, MANIFEST_MEDIA_TYPE, m).err())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap_or_else(|_| vec!["manifest thread panicked".to_string()])).collect()
+        });
+        if let Some(e) = errors.first() {
+            return Err(format!("{} manifest upload(s) failed, e.g. {e}", errors.len()));
         }
         Ok(pending.len())
     }
@@ -223,8 +280,10 @@ fn get_blob_retrying(reg: &Registry, hash: &str) -> Result<Vec<u8>, String> {
 }
 
 impl Store for GhcrStore {
+    /// Local only: blobs of accepted remote results are prefetched, and
+    /// anything else buck2 simply uploads (cheap, local).
     fn has_blob(&self, hash: &str) -> bool {
-        self.local.has_blob(hash) || self.readers.iter().any(|r| r.blob_exists(hash).unwrap_or(false))
+        self.local.has_blob(hash)
     }
 
     fn get_blob(&self, hash: &str) -> Option<Vec<u8>> {
