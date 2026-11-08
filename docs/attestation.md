@@ -137,6 +137,20 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
 
 ## Settled
 
+- Attested build end to end (hartland-packages run 42488633099):
+  hartland-packages' `attested.yml` called `nhawkes/hartland/.github/
+  workflows/build.yml@ca0821d`. The builder read its own commit from its
+  OIDC token, took all tools from hartland at that commit, ran the proxy as
+  `runner`, buck2 as `hlbuild` and every action as `hlsandbox` in bwrap.
+  Phase 1: 5/5 actions executed remotely on the proxy, 5 results signed and
+  published to ghcr.io/nhawkes/hartland-cache. Phase 2: a fresh proxy with
+  an empty store rebuilt `//examples/...` at 100% cache hits (5/5), every
+  hit verified against the keyring.
+- Execution design: the signing proxy executes actions itself and refuses
+  client UpdateActionResult, and attested builds are remote-only. Local
+  actions would share a uid with the signer (able to read its token
+  credentials or upload forged results), so they are excluded by design.
+
 - Registry store end to end on a hosted runner (spikes/store/test.sh): a
   result stored through `hartland proxy` was signed with the job's OIDC token
   and published on SIGTERM; a fresh proxy with an empty disk store found,
