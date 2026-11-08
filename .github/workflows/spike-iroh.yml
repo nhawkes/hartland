@@ -1,0 +1,21 @@
+# Registers spike-iroh for workflow_dispatch, which GitHub only triggers for
+# workflows present on the default branch. The spike itself lives on the
+# spike/iroh branch: runs dispatched there use that branch's version of this
+# file. Nothing here ever runs.
+name: spike-iroh
+on:
+  workflow_dispatch:
+    inputs:
+      coordinator:
+        description: the coordinator's public key
+        required: true
+      coordinator_run:
+        description: the coordinator's run id
+        required: true
+permissions: {}
+jobs:
+  noop:
+    if: false
+    runs-on: ubuntu-24.04
+    steps:
+      - run: "true"
