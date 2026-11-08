@@ -1,81 +1,93 @@
-# Spike: can two hosted runners in one run reach each other over iroh, and
-# authenticate each other with OIDC tokens alone? See spikes/iroh.
-# Compute is capped: one build, two short peer jobs with hard deadlines.
+# Spike: a coordinator job dispatches a worker as a separate run, and the two
+# verify each other by a chain of keys certified by OIDC tokens. See
+# spikes/iroh. Compute is capped: one build, short jobs with hard deadlines,
+# and the worker run starts only because the coordinator dispatched it.
+#
+# workflow_dispatch needs this file on the default branch; the run itself
+# uses the version on the ref it is dispatched to.
 name: spike-iroh
 on:
   push:
     branches: [spike/iroh]
+  workflow_dispatch:
+    inputs:
+      coordinator:
+        description: the coordinator's public key
+        required: true
+      coordinator_run:
+        description: the coordinator's run id
+        required: true
 permissions:
   contents: write
-  packages: write
+  actions: write
   id-token: write
-env:
-  REGISTRY_USER: ${{ github.actor }}
-  REGISTRY_PASSWORD: ${{ github.token }}
-  NAMESPACE: nhawkes/hartland-spike-cache
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Fetch
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/iroh-spike
+          key: iroh-spike-${{ github.sha }}
+          lookup-only: true
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           git init -q hl && cd hl
           git fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
           git checkout -q FETCH_HEAD
-      - name: Build
-        run: cd hl/spikes/iroh && cargo build --locked --release -q && cp target/release/iroh-spike "$RUNNER_TEMP/"
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          cd spikes/iroh && cargo build --locked --release -q && cp target/release/iroh-spike "$RUNNER_TEMP/"
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/iroh-spike
-          key: iroh-spike-${{ github.run_id }}-${{ github.run_attempt }}
+          key: iroh-spike-${{ github.sha }}
 
-  peer:
+  run:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 8
-    strategy:
-      fail-fast: false
-      matrix:
-        role: [listen, connect]
-    outputs:
-      listen: ${{ steps.run.outputs.listen }}
-      connect: ${{ steps.run.outputs.connect }}
+    env:
+      ROLE: ${{ github.event_name == 'workflow_dispatch' && 'worker' || 'coordinator' }}
     steps:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/iroh-spike
-          key: iroh-spike-${{ github.run_id }}-${{ github.run_attempt }}
+          key: iroh-spike-${{ github.sha }}
           fail-on-cache-miss: true
       - name: Fetch the key archive
-        run: |
-          curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/keys/github-actions-jwks.json" -o jwks.json
-      - id: run
-        name: Run ${{ matrix.role }}
-        run: |
-          "$RUNNER_TEMP/iroh-spike" --namespace "$NAMESPACE" \
-            --workflow "$GITHUB_REPOSITORY/.github/workflows/spike-iroh.yml" --commit "$GITHUB_SHA" \
-            --run-id "$GITHUB_RUN_ID" --jwks jwks.json --out report.json --deadline 180 \
-            ${{ matrix.role }}
-          echo "${{ matrix.role }}=$(cat report.json)" >> "$GITHUB_OUTPUT"
-
-  report:
-    needs: peer
-    if: always()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 3
-    steps:
-      - name: Publish reports
+        run: curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/keys/github-actions-jwks.json" -o jwks.json
+      - name: Run as ${{ env.ROLE }}
         env:
-          LISTEN: ${{ needs.peer.outputs.listen }}
-          CONNECT: ${{ needs.peer.outputs.connect }}
+          GITHUB_TOKEN: ${{ github.token }}
+          COORDINATOR: ${{ inputs.coordinator }}
+          COORDINATOR_RUN: ${{ inputs.coordinator_run }}
+        run: |
+          set -euo pipefail
+          common=(--workflow "$GITHUB_REPOSITORY/.github/workflows/spike-iroh.yml" --commit "$GITHUB_SHA" --jwks jwks.json --out report.json)
+          if [ "$ROLE" = worker ]; then
+            "$RUNNER_TEMP/iroh-spike" "${common[@]}" --deadline 180 worker --coordinator "$COORDINATOR" --coordinator-run "$COORDINATOR_RUN"
+            exit 0
+          fi
+          "$RUNNER_TEMP/iroh-spike" "${common[@]}" --deadline 300 coordinator --key-file key.txt &
+          spike=$!
+          for _ in $(seq 60); do [ -s key.txt ] && break; sleep 1; done
+          [ -s key.txt ] || { echo "coordinator did not start"; kill "$spike"; exit 1; }
+          # One worker, dispatched with our key and run id.
+          curl -fsS -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/spike-iroh.yml/dispatches" \
+            -d "{\"ref\":\"$GITHUB_REF_NAME\",\"inputs\":{\"coordinator\":\"$(cat key.txt)\",\"coordinator_run\":\"$GITHUB_RUN_ID\"}}"
+          wait "$spike"
+      - name: Publish report
+        if: always()
+        env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          mkdir r && cd r
-          printf '%s\n' "$LISTEN" > listen.json
-          printf '%s\n' "$CONNECT" > connect.json
-          git init -q && git checkout -q -b results
+          mkdir r && cp report.json "r/$ROLE.json" 2>/dev/null || echo '{"error":"no report"}' > "r/$ROLE.json"
+          cd r && git init -q && git checkout -q -b results
           git -c user.name=hartland -c user.email=hartland@invalid add -A
-          git -c user.name=hartland -c user.email=hartland@invalid commit -qm "iroh spike, run $GITHUB_RUN_ID"
+          git -c user.name=hartland -c user.email=hartland@invalid commit -qm "iroh chain spike: $ROLE, run $GITHUB_RUN_ID"
           auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
-          git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" HEAD:refs/heads/spike/iroh-results
+          git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" "HEAD:refs/heads/spike/iroh-$ROLE"

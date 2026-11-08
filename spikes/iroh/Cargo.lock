@@ -1754,11 +1754,9 @@ name = "iroh-spike"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
  "clap",
  "hartland",
  "iroh",
- "oci-spec",
  "serde",
  "serde_json",
  "tokio",
