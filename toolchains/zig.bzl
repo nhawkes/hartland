@@ -91,12 +91,15 @@ def _cxx_zig_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
         c_compiler_info = CCompilerInfo(
             compiler = tool("cc"),
             compiler_type = "clang",
+            # Hermetic actions: safe to share through a remote cache.
+            allow_cache_upload = True,
             compiler_flags = cmd_args(target, ctx.attrs.c_compiler_flags),
             preprocessor_flags = cmd_args(ctx.attrs.c_preprocessor_flags),
         ),
         cxx_compiler_info = CxxCompilerInfo(
             compiler = tool("c++"),
             compiler_type = "clang",
+            allow_cache_upload = True,
             compiler_flags = cmd_args(target, ctx.attrs.cxx_compiler_flags),
             preprocessor_flags = cmd_args(ctx.attrs.cxx_preprocessor_flags),
         ),

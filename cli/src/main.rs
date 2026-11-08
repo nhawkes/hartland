@@ -117,16 +117,33 @@ fn oci_probe(f: &HashMap<String, String>) -> Result<(), String> {
     let mut reg = Registry::new(host, repo);
     reg.login(host, &user, &pass)?;
 
-    // 1. Many small blobs.
+    // 1. Many small blobs, uploaded by `parallel` threads.
+    let parallel: usize = f.get("parallel").map(|p| p.parse()).transpose().map_err(|e| format!("--parallel: {e}"))?.unwrap_or(1).max(1);
+    report.insert("parallel".into(), json!(parallel));
     let start = Instant::now();
-    let mut hashes = Vec::new();
-    let mut failures = Vec::new();
-    for i in 0..count {
-        match reg.put_blob(format!("hartland probe blob {salt} {i}").as_bytes()) {
+    let results: Vec<Result<String, String>> = std::thread::scope(|s| {
+        let reg = &reg;
+        let salt = &salt;
+        let handles: Vec<_> = (0..parallel)
+            .map(|t| {
+                s.spawn(move || {
+                    (t..count)
+                        .step_by(parallel)
+                        .map(|i| reg.put_blob(format!("hartland probe blob {salt} {i}").as_bytes()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    });
+    let (mut hashes, mut failures) = (Vec::new(), Vec::new());
+    for r in results {
+        match r {
             Ok(h) => hashes.push(h),
             Err(e) => failures.push(e),
         }
     }
+    hashes.sort();
     let ms = start.elapsed().as_millis();
     report.insert("blobs_pushed".into(), json!(hashes.len()));
     report.insert("blob_failures".into(), json!(failures.iter().take(5).collect::<Vec<_>>()));
@@ -137,7 +154,16 @@ fn oci_probe(f: &HashMap<String, String>) -> Result<(), String> {
     report.insert("blob_exists_ms_each".into(), json!(start.elapsed().as_millis() as f64 / hashes.len().max(1) as f64));
     report.insert("blobs_found".into(), json!(exists));
     if let Some(h) = hashes.first() {
-        report.insert("blob_roundtrip_ok".into(), json!(reg.get_blob(h).is_ok()));
+        let r = reg.get_blob(h);
+        report.insert("blob_roundtrip_ok".into(), json!(r.is_ok()));
+        if let Err(e) = r {
+            report.insert("blob_roundtrip_error".into(), json!(e.chars().take(400).collect::<String>()));
+        }
+        // Raw status of the blob GET, without following redirects.
+        if let Ok(raw) = reg.get_blob_raw(h) {
+            report.insert("blob_get_status".into(), json!(raw.status));
+            report.insert("blob_get_location_host".into(), json!(raw.header("Location").map(|l| l.split('/').nth(2).unwrap_or("").to_string())));
+        }
     }
 
     // 2. A cache entry: manifest tagged with the action digest.
@@ -200,6 +226,55 @@ fn run(args: &[String]) -> Result<(), String> {
         "sandbox setup" => return hartland::sandbox::setup(),
         "sandbox run" => return sandbox_run(rest),
         "oci probe" => return oci_probe(&flags(rest)?),
+        "proxy put" => {
+            let f = flags(rest)?;
+            let addr = need(&f, "addr")?.to_string();
+            let data = std::fs::read(need(&f, "file")?).map_err(|e| e.to_string())?;
+            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            return rt.block_on(async move {
+                use hartland::reapi::re;
+                let digest = re::Digest { hash: hartland::attest::sha256_hex(&data), size_bytes: data.len() as i64 };
+                let mut cas = re::content_addressable_storage_client::ContentAddressableStorageClient::connect(addr)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .max_decoding_message_size(64 << 20)
+                    .max_encoding_message_size(64 << 20);
+                cas.batch_update_blobs(re::BatchUpdateBlobsRequest {
+                    requests: vec![re::batch_update_blobs_request::Request { digest: Some(digest.clone()), data, compressor: 0 }],
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                println!("{}/{}", digest.hash, digest.size_bytes);
+                Ok(())
+            });
+        }
+        "proxy check" => {
+            let f = flags(rest)?;
+            let addr = need(&f, "addr")?.to_string();
+            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            return rt.block_on(async move {
+                use hartland::reapi::re;
+                let mut caps = re::capabilities_client::CapabilitiesClient::connect(addr.clone()).await.map_err(|e| format!("connect: {e}"))?;
+                let c = caps.get_capabilities(re::GetCapabilitiesRequest::default()).await.map_err(|e| e.to_string())?;
+                println!("capabilities: {:?}", c.into_inner().cache_capabilities.map(|c| c.digest_functions));
+                let mut cas = re::content_addressable_storage_client::ContentAddressableStorageClient::connect(addr).await.map_err(|e| e.to_string())?;
+                let data = b"hartland proxy check".to_vec();
+                let digest = re::Digest { hash: hartland::attest::sha256_hex(&data), size_bytes: data.len() as i64 };
+                cas.batch_update_blobs(re::BatchUpdateBlobsRequest {
+                    requests: vec![re::batch_update_blobs_request::Request { digest: Some(digest.clone()), data, compressor: 0 }],
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                let missing = cas
+                    .find_missing_blobs(re::FindMissingBlobsRequest { blob_digests: vec![digest], ..Default::default() })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                println!("missing after upload: {}", missing.into_inner().missing_blob_digests.len());
+                Ok(())
+            });
+        }
         "proxy serve" => {
             let f = flags(rest)?;
             let store = hartland::proxy::DiskStore::new(need(&f, "dir")?.into())?;
