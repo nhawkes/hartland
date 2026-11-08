@@ -7,6 +7,7 @@ pub mod bundle;
 pub mod cas;
 pub mod cert;
 pub mod digest;
+pub mod dispatch;
 pub mod execute;
 pub mod ghcr_store;
 pub mod github;

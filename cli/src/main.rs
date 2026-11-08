@@ -204,6 +204,25 @@ struct RegistryArgs {
     promote: Promote,
 }
 
+/// Scale-out: hand actions to workers dispatched on demand. Needs the
+/// registry trust options, `GITHUB_TOKEN` with `actions: write`, and the
+/// job's OIDC credentials.
+#[derive(Args)]
+struct ScaleArgs {
+    /// The workflow file (in this repository) that runs workers.
+    #[arg(long, requires_all = ["registry", "execute"])]
+    worker_workflow: Option<String>,
+    /// The ref to dispatch workers on.
+    #[arg(long, requires = "worker_workflow")]
+    worker_ref: Option<String>,
+    /// Most workers at once.
+    #[arg(long, default_value_t = 8)]
+    max_workers: usize,
+    /// Actions one worker runs at once.
+    #[arg(long, default_value_t = 2)]
+    worker_slots: usize,
+}
+
 #[derive(Subcommand)]
 enum ProxyCommand {
     /// Serve the Remote Execution API.
@@ -219,6 +238,30 @@ enum ProxyCommand {
         /// Seconds between publishes (and at shutdown).
         #[arg(long, default_value_t = 300)]
         publish_every: u64,
+        #[command(flatten)]
+        scale: ScaleArgs,
+    },
+    /// Join a coordinator as a worker (in a dispatched run): run the actions
+    /// it sends in the sandbox, sign the results, leave when idle.
+    Worker {
+        #[arg(long)]
+        dir: PathBuf,
+        /// The coordinator's public key (from the dispatch inputs).
+        #[arg(long)]
+        coordinator: hartland::cert::PublicKey,
+        /// The coordinator's run (from the dispatch inputs).
+        #[arg(long)]
+        coordinator_run: String,
+        #[command(flatten)]
+        trust: Trust,
+        #[arg(long, value_enum, default_value = "sandbox")]
+        execute: Execute,
+        /// Actions to run at once.
+        #[arg(long, default_value_t = 2)]
+        slots: usize,
+        /// Leave after this many seconds without work.
+        #[arg(long, default_value_t = 60)]
+        idle: u64,
     },
     /// Push the registry writes queued in the first tier's outbox (verified
     /// batches only), off the build's critical path.
@@ -472,6 +515,15 @@ async fn with_execution(
     let Some(execute) = execute else {
         return Ok(proxy);
     };
+    Ok(proxy.with_executor(executor(store, execute).await?))
+}
+
+/// The sandbox executor. Its scratch is under the system temp dir: the
+/// sandbox uid must be able to traverse to its directories.
+async fn executor(
+    store: Arc<dyn Store>,
+    execute: Execute,
+) -> anyhow::Result<hartland::execute::Executor> {
     let scratch = std::env::temp_dir().join(format!("hartland-exec-{}", std::process::id()));
     tokio::fs::create_dir_all(&scratch).await?;
     {
@@ -483,7 +535,54 @@ async fn with_execution(
         sandbox = if drop_user { "uid" } else { "unprivileged" },
         "remote execution enabled"
     );
-    Ok(proxy.with_executor(hartland::execute::Executor::new(store, drop_user, scratch)))
+    Ok(hartland::execute::Executor::new(store, drop_user, scratch))
+}
+
+fn env(name: &str) -> anyhow::Result<String> {
+    std::env::var(name).with_context(|| format!("{name} is not set"))
+}
+
+/// Coordinator side of scale-out: a certified key, an iroh endpoint, the
+/// worker pool and the dispatcher.
+async fn scale_out(
+    scale: &ScaleArgs,
+    proxy: Proxy,
+    store: Arc<dyn Store>,
+    keyring: Keyring,
+    jwks: Jwks,
+) -> anyhow::Result<(Proxy, Option<Arc<hartland::worker::Pool>>)> {
+    let Some(workflow) = &scale.worker_workflow else {
+        return Ok((proxy, None));
+    };
+    let mut identity = hartland::cert::Identity::generate()?;
+    identity.certify().await?;
+    let repository = env("GITHUB_REPOSITORY")?;
+    let trust = hartland::worker::PeerTrust {
+        keyring,
+        jwks,
+        repository: repository.parse()?,
+    };
+    let ep = hartland::worker::bind(&identity, hartland::worker::Network::N0).await?;
+    let key = identity.public();
+    let pool = hartland::worker::Pool::new(identity, trust, store);
+    tokio::spawn(pool.clone().serve(ep));
+    let proxy = proxy.with_pool(pool.clone());
+    let dispatcher = hartland::dispatch::Dispatcher {
+        repository,
+        workflow: workflow.clone(),
+        git_ref: match &scale.worker_ref {
+            Some(r) => r.clone(),
+            None => env("GITHUB_REF_NAME")?,
+        },
+        token: env("GITHUB_TOKEN")?,
+        coordinator: key,
+        coordinator_run: env("GITHUB_RUN_ID")?,
+        max_workers: scale.max_workers,
+        worker_slots: scale.worker_slots,
+    };
+    tokio::spawn(dispatcher.run(pool.clone(), proxy.queued()));
+    tracing::info!(coordinator = %key, max_workers = scale.max_workers, "scale-out enabled");
+    Ok((proxy, Some(pool)))
 }
 
 fn registry_credentials() -> Option<(String, String)> {
@@ -539,6 +638,7 @@ async fn proxy(c: ProxyCommand) -> anyhow::Result<()> {
             execute,
             registry,
             publish_every,
+            scale,
         } => {
             let disk = DiskStore::open(dir).await?;
             if registry.registry.is_none() {
@@ -554,8 +654,50 @@ async fn proxy(c: ProxyCommand) -> anyhow::Result<()> {
                 execute,
                 Arc::new(ghcr_store(disk, &registry).await?),
                 publish_every,
+                &registry,
+                &scale,
             )
             .await
+        }
+        ProxyCommand::Worker {
+            dir,
+            coordinator,
+            coordinator_run,
+            trust,
+            execute,
+            slots,
+            idle,
+        } => {
+            hartland::sandbox::setup().await?;
+            let (keyring, jwks) = trust.load().await?;
+            let mut identity = hartland::cert::Identity::generate()?;
+            identity.certify().await?;
+            let config = hartland::worker::WorkerConfig {
+                identity,
+                coordinator: hartland::worker::endpoint_addr(&coordinator)?,
+                coordinator_run,
+                trust: hartland::worker::PeerTrust {
+                    keyring,
+                    jwks,
+                    repository: env("GITHUB_REPOSITORY")?.parse()?,
+                },
+                dir,
+                slots,
+                idle: std::time::Duration::from_secs(idle),
+                network: hartland::worker::Network::N0,
+            };
+            // The executor is built on the worker's store, which the worker
+            // sets up once it has joined.
+            let runner = move |store: Arc<dyn Store>| -> Arc<dyn hartland::worker::Runner> {
+                Arc::new(LazyExecutor {
+                    store,
+                    execute,
+                    executor: tokio::sync::OnceCell::new(),
+                })
+            };
+            let executed = hartland::worker::run_worker(config, runner).await?;
+            tracing::info!(executed, "worker done");
+            Ok(())
         }
         ProxyCommand::Promote { dir, registry } => {
             ensure!(
@@ -584,11 +726,32 @@ async fn proxy(c: ProxyCommand) -> anyhow::Result<()> {
     }
 }
 
+/// The sandbox executor, created on first use (its setup is async).
+struct LazyExecutor {
+    store: Arc<dyn Store>,
+    execute: Execute,
+    executor: tokio::sync::OnceCell<hartland::execute::Executor>,
+}
+
+#[async_trait::async_trait]
+impl hartland::worker::Runner for LazyExecutor {
+    async fn run(&self, action: ActionDigest) -> Result<re::ActionResult, String> {
+        let executor = self
+            .executor
+            .get_or_try_init(|| executor(self.store.clone(), self.execute))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        executor.execute(action).await.map_err(|e| e.to_string())
+    }
+}
+
 async fn serve_registry(
     listen: SocketAddr,
     execute: Option<Execute>,
     store: Arc<GhcrStore>,
     publish_every: u64,
+    registry: &RegistryArgs,
+    scale: &ScaleArgs,
 ) -> anyhow::Result<()> {
     // Serve from the first tier at once; read the registry indexes in the
     // background (misses and publishing wait for them).
@@ -603,18 +766,31 @@ async fn serve_registry(
     });
     tracing::info!(addr = %listen, store = "registry", "listening");
     let dyn_store: Arc<dyn Store> = store.clone();
-    let serve = with_execution(Proxy::new(dyn_store.clone()), dyn_store, execute)
-        .await?
-        .serve(listen);
+    let proxy = with_execution(Proxy::new(dyn_store.clone()), dyn_store.clone(), execute).await?;
+    let trust = Trust {
+        keyring: registry.keyring.clone().context("--keyring is required")?,
+        jwks: registry.jwks.clone().context("--jwks is required")?,
+    };
+    let (keyring, jwks) = trust.load().await?;
+    let (proxy, pool) = scale_out(scale, proxy, dyn_store, keyring, jwks).await?;
+    let serve = proxy.serve(listen);
+    // Workers' results are signed by the workers: collect their batches
+    // before every publish.
+    let publish = |store: Arc<GhcrStore>, pool: Option<Arc<hartland::worker::Pool>>| async move {
+        if let Some(pool) = pool {
+            pool.flush().await;
+        }
+        report_publish(store.publish().await);
+    };
     let periodic = {
-        let store = store.clone();
+        let (store, pool) = (store.clone(), pool.clone());
         async move {
             let mut tick =
                 tokio::time::interval(std::time::Duration::from_secs(publish_every.max(1)));
             tick.tick().await;
             loop {
                 tick.tick().await;
-                report_publish(store.publish().await);
+                publish(store.clone(), pool.clone()).await;
             }
         }
     };
@@ -626,7 +802,7 @@ async fn serve_registry(
         _ = term.recv() => {}
     }
     tracing::info!("shutting down; publishing pending results");
-    report_publish(store.publish().await);
+    publish(store, pool).await;
     Ok(())
 }
 

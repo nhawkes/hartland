@@ -228,6 +228,8 @@ pub struct Pool {
     trust: PeerTrust,
     store: Arc<dyn Store>,
     members: papaya::HashMap<PublicKey, Arc<Member>>,
+    /// Workers admitted so far (for the dispatcher's accounting).
+    joined: AtomicUsize,
     /// Signalled when a worker joins or a worker slot frees.
     freed: Notify,
 }
@@ -252,6 +254,7 @@ impl Pool {
             trust,
             store,
             members: papaya::HashMap::new(),
+            joined: AtomicUsize::new(0),
             freed: Notify::new(),
         })
     }
@@ -265,6 +268,16 @@ impl Pool {
         self.members.pin().values().fold((0, 0), |(b, t), m| {
             (b + m.busy.load(Ordering::Acquire), t + m.slots)
         })
+    }
+
+    /// Workers connected now.
+    pub fn members(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Workers admitted since the start.
+    pub fn joined(&self) -> usize {
+        self.joined.load(Ordering::Acquire)
     }
 
     /// Waits until a worker joins or a slot frees.
@@ -379,6 +392,7 @@ impl Pool {
                                 busy: AtomicUsize::new(0),
                             }),
                         );
+                        pool.joined.fetch_add(1, Ordering::AcqRel);
                         pool.freed.notify_waiters();
                         pool.serve_member(&conn, &key).await;
                         pool.members.pin().remove(&key);
