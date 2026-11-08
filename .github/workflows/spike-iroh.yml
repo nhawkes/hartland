@@ -1,0 +1,81 @@
+# Spike: can two hosted runners in one run reach each other over iroh, and
+# authenticate each other with OIDC tokens alone? See spikes/iroh.
+# Compute is capped: one build, two short peer jobs with hard deadlines.
+name: spike-iroh
+on:
+  push:
+    branches: [spike/iroh]
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+env:
+  REGISTRY_USER: ${{ github.actor }}
+  REGISTRY_PASSWORD: ${{ github.token }}
+  NAMESPACE: nhawkes/hartland-spike-cache
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch
+        run: |
+          git init -q hl && cd hl
+          git fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+      - name: Build
+        run: cd hl/spikes/iroh && cargo build --locked --release -q && cp target/release/iroh-spike "$RUNNER_TEMP/"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/iroh-spike
+          key: iroh-spike-${{ github.run_id }}-${{ github.run_attempt }}
+
+  peer:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [listen, connect]
+    outputs:
+      listen: ${{ steps.run.outputs.listen }}
+      connect: ${{ steps.run.outputs.connect }}
+    steps:
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/iroh-spike
+          key: iroh-spike-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+      - name: Fetch the key archive
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/keys/github-actions-jwks.json" -o jwks.json
+      - id: run
+        name: Run ${{ matrix.role }}
+        run: |
+          "$RUNNER_TEMP/iroh-spike" --namespace "$NAMESPACE" \
+            --workflow "$GITHUB_REPOSITORY/.github/workflows/spike-iroh.yml" --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --jwks jwks.json --out report.json --deadline 180 \
+            ${{ matrix.role }}
+          echo "${{ matrix.role }}=$(cat report.json)" >> "$GITHUB_OUTPUT"
+
+  report:
+    needs: peer
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Publish reports
+        env:
+          LISTEN: ${{ needs.peer.outputs.listen }}
+          CONNECT: ${{ needs.peer.outputs.connect }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir r && cd r
+          printf '%s\n' "$LISTEN" > listen.json
+          printf '%s\n' "$CONNECT" > connect.json
+          git init -q && git checkout -q -b results
+          git -c user.name=hartland -c user.email=hartland@invalid add -A
+          git -c user.name=hartland -c user.email=hartland@invalid commit -qm "iroh spike, run $GITHUB_RUN_ID"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" HEAD:refs/heads/spike/iroh-results

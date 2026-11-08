@@ -3,7 +3,6 @@
 //! A builder is a reusable workflow, pinned to commits, running on a
 //! GitHub-hosted runner. Who called it does not matter.
 
-use crate::attest::Audience;
 use crate::digest::GitSha;
 use monostate::MustBe;
 use serde::{Deserialize, Serialize};
@@ -205,8 +204,9 @@ impl Keyring {
     }
 
     /// Accepts verified claims from a trusted builder on a hosted runner,
-    /// bound to `audience`.
-    pub fn accept(&self, claims: &Claims, audience: &Audience) -> Result<Signer, TrustError> {
+    /// bound to `audience` (an attestation's `Audience`, or any other
+    /// binding such as a peer's endpoint key).
+    pub fn accept(&self, claims: &Claims, audience: &impl fmt::Display) -> Result<Signer, TrustError> {
         if claims.aud != [audience.to_string()] {
             return Err(TrustError::Audience);
         }
