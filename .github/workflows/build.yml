@@ -1,0 +1,74 @@
+# Hartland's trusted builder. Callers (a hartland-packages repo or a fork) run:
+#
+#   jobs:
+#     attest:
+#       permissions: {contents: read, packages: write, id-token: write}
+#       uses: nhawkes/hartland/.github/workflows/build.yml@<commit>
+#
+# Keyrings trust this file at pinned commits on GitHub-hosted runners. All
+# trusted code is fetched from hartland at the builder's own commit, read from
+# the job's OIDC token (job_workflow_sha), never from the caller.
+name: hartland-build
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: buck2 target patterns to build
+        type: string
+        default: "//..."
+      publish_results:
+        description: push logs to the caller's attest-results branch (needs contents write)
+        type: boolean
+        default: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      REGISTRY_USER: ${{ github.actor }}
+      REGISTRY_PASSWORD: ${{ github.token }}
+    steps:
+      - name: Identify this builder
+        id: self
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=hartland-builder-identity" \
+            | python3 -c 'import base64,json,sys; t=json.load(sys.stdin)["value"].split(".")[1]; t+="="*(-len(t)%4); c=json.loads(base64.urlsafe_b64decode(t)); assert c["job_workflow_ref"].startswith("nhawkes/hartland/.github/workflows/build.yml@"), c["job_workflow_ref"]; print(c["job_workflow_sha"])')"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "builder commit $sha"
+      - name: Fetch hartland at the builder commit
+        shell: bash
+        run: |
+          git init -q hl && cd hl
+          git fetch -q --depth 1 https://github.com/nhawkes/hartland "${{ steps.self.outputs.sha }}"
+          git checkout -q FETCH_HEAD
+      - name: Fetch the caller
+        shell: bash
+        run: |
+          git init -q caller && cd caller
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY"
+          git -c http.extraheader="$auth" submodule update -q --init --depth 1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Attested build
+        shell: bash
+        run: bash hl/ci/attested-build.sh hl caller "${{ inputs.targets }}" results
+        env:
+          BUILDER_SHA: ${{ steps.self.outputs.sha }}
+      - name: Publish logs
+        if: always() && inputs.publish_results
+        shell: bash
+        run: |
+          mkdir -p results && cd results
+          git init -q && git checkout -q -b results
+          git -c user.name=hartland -c user.email=hartland@invalid add -A
+          git -c user.name=hartland -c user.email=hartland@invalid commit -qm "attested build logs for $GITHUB_SHA (run $GITHUB_RUN_ID)"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" HEAD:refs/heads/attest-results
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
