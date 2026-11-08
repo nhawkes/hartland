@@ -28,10 +28,14 @@ jobs:
           cp src/spikes/attest/sample-results.json results/
           src/cli/target/release/hartland attest sign --results results/sample-results.json --out results/envelope.json
       - name: Sandbox probe as the sandbox user
+        if: always()
         run: |
+          set -x
+          exec > >(tee results/sandbox-log.txt) 2>&1
           mkdir -p sb/in sb/collect
           gcc -static -O2 -o sb/in/probe src/cli/tests/probe/probe.c
           echo hi > sb/in/input.txt
+          which bwrap || sudo apt-get install -qy bubblewrap
           src/cli/target/release/hartland sandbox setup
           src/cli/target/release/hartland sandbox run --input sb/in --collect sb/collect \
             --output out/report.txt --env HARTLAND_TEST=yes -- /work/probe
