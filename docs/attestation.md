@@ -138,6 +138,17 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
 
 ## Settled
 
+- Sandbox on a hosted runner (`hartland sandbox run`, bubblewrap as uid
+  hlsandbox, empty tmpfs root): with OIDC credentials present in the
+  worker's environment, the action ran as uid 1002, saw no token, root held
+  only work/proc/dev/tmp, no /home, no sudo, network unreachable, 2 visible
+  PIDs, inputs and declared env present, no scratch left behind.
+- bubblewrap is not preinstalled on ubuntu-24.04 runners; `sandbox setup`
+  installs it from Ubuntu's archive. TODO: ship a pinned static bwrap.
+- End to end: a batch signed in Actions (`hartland attest sign`) verifies
+  locally (`hartland attest verify`) against the archived JWKS with a keyring
+  trusting that workflow at that commit, and is rejected by one that does not.
+
 - buck2 local execution with a remote cache: `CommandExecutorConfig(
   local_enabled = True, remote_enabled = False, remote_cache_enabled = True,
   allow_cache_uploads = True)` is a distinct executor in buck2

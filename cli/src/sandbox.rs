@@ -56,7 +56,15 @@ fn sudo(args: &[&str]) -> Result<(), String> {
 }
 
 /// One-off runner preparation. Idempotent.
+///
+/// bubblewrap is not on the GitHub runner image, so it comes from Ubuntu's
+/// archive here. That widens the trust base to Ubuntu's mirror; replace with a
+/// pinned static build from our own toolchain.
 pub fn setup() -> Result<(), String> {
+    let have_bwrap = Command::new("bwrap").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status();
+    if !matches!(have_bwrap, Ok(s) if s.success()) {
+        sudo(&["apt-get", "install", "-qy", "bubblewrap"])?;
+    }
     sudo(&["sysctl", "-q", "kernel.apparmor_restrict_unprivileged_userns=0"])?;
     let exists = Command::new("id").arg(SANDBOX_USER).stdout(Stdio::null()).stderr(Stdio::null()).status();
     if !matches!(exists, Ok(s) if s.success()) {
