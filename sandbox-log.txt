@@ -1,0 +1,43 @@
++ mkdir -p sb/in sb/collect
++ gcc -static -O2 -o sb/in/probe src/cli/tests/probe/probe.c
++ echo hi
++ which bwrap
++ sudo apt-get install -qy bubblewrap
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following NEW packages will be installed:
+  bubblewrap
+0 upgraded, 1 newly installed, 0 to remove and 1 not upgraded.
+Need to get 50.4 kB of archives.
+After this operation, 133 kB of additional disk space will be used.
+Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+Get:2 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 bubblewrap amd64 0.9.0-1ubuntu0.3 [50.4 kB]
+Fetched 50.4 kB in 0s (622 kB/s)
+Selecting previously unselected package bubblewrap.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 215960 files and directories currently installed.)
+Preparing to unpack .../bubblewrap_0.9.0-1ubuntu0.3_amd64.deb ...
+Unpacking bubblewrap (0.9.0-1ubuntu0.3) ...
+Setting up bubblewrap (0.9.0-1ubuntu0.3) ...
+Processing triggers for man-db (2.12.0-4build2) ...
+Not building database; man-db/auto-update is not 'true'.
+
+Running kernel seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
++ src/cli/target/release/hartland sandbox setup
++ src/cli/target/release/hartland sandbox run --input sb/in --collect sb/collect --output out/report.txt --env HARTLAND_TEST=yes -- /work/probe
+probe done
++ cp sb/collect/out/report.txt results/sandbox-report.txt
+++ '[' -n eyJhbGciOiJSUzI1NiIsImtpZCI6IjM4ODI2YjE3LTZhMzAtNWY5Yi1iMTY5LThiZWI4MjAyZjcyMyIsInR5cCI6IkpXVCIsIng1dCI6InlrTmFZNHFNX3RhNGsyVGdaT0NFWUxrY1lsQSJ9.eyJJZGVudGl0eVR5cGVDbGFpbSI6IlN5c3RlbTpTZXJ2aWNlSWRlbnRpdHkiLCJhYyI6Ilt7XCJTY29wZVwiOlwicmVmcy9oZWFkcy9zcGlrZS9hdHRlc3RcIixcIlBlcm1pc3Npb25cIjozfSx7XCJTY29wZVwiOlwicmVmcy9oZWFkcy9tYWluXCIsXCJQZXJtaXNzaW9uXCI6MX1dIiwiYWNzbCI6IjEwIiwiYXVkIjoidnNvOjMwZmExZDE5LTM2MGUtNDI1Yy1hYWZlLWFiODVjZGJiMGNiMiIsImJpbGxpbmdfb3duZXJfaWQiOiJVX2tnRE9BSDZtRkEiLCJleHAiOjE3OTQxNDUwNDQsImh0dHA6Ly9zY2hlbWFzLm1pY3Jvc29mdC5jb20vd3MvMjAwOC8wNi9pZGVudGl0eS9jbGFpbXMvcHJpbWFyeXNpZCI6ImRkZGRkZGRkLWRkZGQtZGRkZC1kZGRkLWRkZGRkZGRkZGRkZCIsImh0dHA6Ly9zY2hlbWFzLnhtbHNvYXAub3JnL3dzLzIwMDUvMDUvaWRlbnRpdHkvY2xhaW1zL3NpZCI6ImRkZGRkZGRkLWRkZGQtZGRkZC1kZGRkLWRkZGRkZGRkZGRkZCIsImlhdCI6MTc5NDE0MzI0NCwiaXNzIjoiaHR0cHM6Ly90b2tlbi5hY3Rpb25zLmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImpvYl9pZCI6IjYxMWE0YWQ3LTEzMDYtNTA5MC1iN2IzLTMxYjQxM2U4ZmViMiIsImpvYl93b3JrZmxvd19yZWYiOiJuaGF3a2VzL2hhcnRsYW5kLy5naXRodWIvd29ya2Zsb3dzL3NwaWtlLWF0dGVzdC55bWxAcmVmcy9oZWFkcy9zcGlrZS9hdHRlc3QiLCJqb2Jfd29ya2Zsb3dfc2hhIjoiZTZjYzY0ODBhZDMyYjU2YWEzOTI2NmNlNTZjMjVjMjk2YmJmOTk0ZSIsIm5hbWVpZCI6ImRkZGRkZGRkLWRkZGQtZGRkZC1kZGRkLWRkZGRkZGRkZGRkZCIsIm5iZiI6MTc5NDE0Mjk0NCwib2lkY19leHRyYSI6IntcImFjdG9yXCI6XCJuaGF3a2VzXCIsXCJhY3Rvcl9pZFwiOlwiODMwMDA1MlwiLFwiYmFzZV9yZWZcIjpcIlwiLFwiY2hlY2tfcnVuX2lkXCI6XCIxMjg3NDAwNjEwMDhcIixcImV2ZW50X25hbWVcIjpcInB1c2hcIixcImhlYWRfcmVmXCI6XCJcIixcImpvYl93b3JrZmxvd19yZWZcIjpcIm5oYXdrZXMvaGFydGxhbmQvLmdpdGh1Yi93b3JrZmxvd3Mvc3Bpa2UtYXR0ZXN0LnltbEByZWZzL2hlYWRzL3NwaWtlL2F0dGVzdFwiLFwiam9iX3dvcmtmbG93X3NoYVwiOlwiZTZjYzY0ODBhZDMyYjU2YWEzOTI2NmNlNTZjMjVjMjk2YmJmOTk0ZVwiLFwicmVmXCI6XCJyZWZzL2hlYWRzL3NwaWtlL2F0dGVzdFwiLFwicmVmX3Byb3RlY3RlZFwiOlwiZmFsc2VcIixcInJlZl90eXBlXCI6XCJicmFuY2hcIixcInJlcG9zaXRvcnlcIjpcIm5oYXdrZXMvaGFydGxhbmRcIixcInJlcG9zaXRvcnlfaWRcIjpcIjE0NDk3OTQ2NTlcIixcInJlcG9zaXRvcnlfb3duZXJcIjpcIm5oYXdrZXNcIixcInJlcG9zaXRvcnlfb3duZXJfaWRcIjpcIjgzMDAwNTJcIixcInJlcG9zaXRvcnlfdmlzaWJpbGl0eVwiOlwicHJpdmF0ZVwiLFwicnVuX2F0dGVtcHRcIjpcIjFcIixcInJ1bl9pZFwiOlwiNDI0ODM0Mjk0MzhcIixcInJ1bl9udW1iZXJcIjpcIjNcIixcInJ1bm5lcl9lbnZpcm9ubWVudFwiOlwiZ2l0aHViLWhvc3RlZFwiLFwic2hhXCI6XCJlNmNjNjQ4MGFkMzJiNTZhYTM5MjY2Y2U1NmMyNWMyOTZiYmY5OTRlXCIsXCJ3b3JrZmxvd1wiOlwic3Bpa2UtYXR0ZXN0XCIsXCJ3b3JrZmxvd19yZWZcIjpcIm5oYXdrZXMvaGFydGxhbmQvLmdpdGh1Yi93b3JrZmxvd3Mvc3Bpa2UtYXR0ZXN0LnltbEByZWZzL2hlYWRzL3NwaWtlL2F0dGVzdFwiLFwid29ya2Zsb3dfc2hhXCI6XCJlNmNjNjQ4MGFkMzJiNTZhYTM5MjY2Y2U1NmMyNWMyOTZiYmY5OTRlXCJ9Iiwib2lkY19zdWIiOiJyZXBvOm5oYXdrZXNAODMwMDA1Mi9oYXJ0bGFuZEAxNDQ5Nzk0NjU5OnJlZjpyZWZzL2hlYWRzL3NwaWtlL2F0dGVzdCIsIm9yY2hfaWQiOiIzZjRjZDBkYy03NTg0LThjNGMtYjlmNS1kYjZiOGZjN2EzMDYuc2lnbi5fX2RlZmF1bHQiLCJvd25lcl9pZCI6IlVfa2dET0FINm1GQSIsInBsYW5faWQiOiIzZjRjZDBkYy03NTg0LThjNGMtYjlmNS1kYjZiOGZjN2EzMDYiLCJyZXBvc2l0b3J5X2lkIjoiMTQ0OTc5NDY1OSIsInJlcG9zaXRvcnlfb3duZXJfaWQiOiI4MzAwMDUyIiwicmVwb3NpdG9yeV92aXNpYmlsaXR5IjoicHJpdmF0ZSIsInJ1bl9pZCI6IjQyNDgzNDI5NDM4IiwicnVuX251bWJlciI6IjMiLCJydW5fdHlwZSI6ImZ1bGwiLCJydW5uZXJfaWQiOiIxMDAwMDAwMDIyIiwicnVubmVyX3R5cGUiOiJob3N0ZWQiLCJzY3AiOiJBY3Rpb25zLlJlc3VsdHM6M2Y0Y2QwZGMtNzU4NC04YzRjLWI5ZjUtZGI2YjhmYzdhMzA2OjYxMWE0YWQ3LTEzMDYtNTA5MC1iN2IzLTMxYjQxM2U4ZmViMiBBY3Rpb25zLlJ1bm5lcjozZjRjZDBkYy03NTg0LThjNGMtYjlmNS1kYjZiOGZjN2EzMDY6NjExYTRhZDctMTMwNi01MDkwLWI3YjMtMzFiNDEzZThmZWIyIEFjdGlvbnMuVXBsb2FkQXJ0aWZhY3RzOjNmNGNkMGRjLTc1ODQtOGM0Yy1iOWY1LWRiNmI4ZmM3YTMwNjo2MTFhNGFkNy0xMzA2LTUwOTAtYjdiMy0zMWI0MTNlOGZlYjIgZ2VuZXJhdGVfaWRfdG9rZW46M2Y0Y2QwZGMtNzU4NC04YzRjLWI5ZjUtZGI2YjhmYzdhMzA2OjYxMWE0YWQ3LTEzMDYtNTA5MC1iN2IzLTMxYjQxM2U4ZmViMiBBY3Rpb25zLkdlbmVyaWNSZWFkOjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMCIsInNoYSI6ImU2Y2M2NDgwYWQzMmI1NmFhMzkyNjZjZTU2YzI1YzI5NmJiZjk5NGUiLCJ0cnVzdF90aWVyIjoiMiJ9.vwwahbolbDxSWEr5cxcva8LnKuLy-ValaLE-uuz8EeSRPt4dsEmV03p0LKpTxi_QjHZtnqBVbAW0GcdBIFG7NxfkHP7NM321um_esh5bXo2OmLHcn8i0Pr256y9ez6qjlVGfKUIz6lmbTXG01dCKCm4Gdtc__l1r3mVWmdGdBha7DnQiYtv0-eHxgSgedluh8mTa7aJJwCebdEdYCR6iAyXqDsmYqri5peOvgM29WDL0LDytBPx4AonZCFeq6DzAgSSkGmWBxMUtrJDUI1fyXJsCZQWt83GJBOGdioQhJqYSfwKUWoSDPa2uXG1JY0CZRsBfcGVASFe6gLEiTmGnQw ']'
+++ echo yes
++ echo worker_sees_token_request=yes
++ ls -A /tmp
++ grep -c '^hartland-action-'
++ sed 's/^/leftover_scratch_dirs=/'

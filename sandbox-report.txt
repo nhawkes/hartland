@@ -1,0 +1,12 @@
+uid=1002 gid=1002
+env_count=2
+env_HARTLAND_TEST=yes
+env_token_request=absent
+root=tmp dev proc work 
+visible_pids=2
+home_exists=no
+sudo_exists=no
+network=blocked (Network is unreachable)
+input_file=present
+worker_sees_token_request=yes
+leftover_scratch_dirs=0
