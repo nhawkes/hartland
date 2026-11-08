@@ -137,6 +137,13 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
 
 ## Settled
 
+- Registry store end to end on a hosted runner (spikes/store/test.sh): a
+  result stored through `hartland proxy` was signed with the job's OIDC token
+  and published on SIGTERM; a fresh proxy with an empty disk store found,
+  verified and served it; the same signed entry copied under another
+  action's tag was refused; a keyring not trusting the workflow commit
+  refused it. All pass.
+
 - GHCR (private package, pushed from Actions with GITHUB_TOKEN):
   - No OCI referrers API (`/v2/<repo>/referrers/<digest>` returns 404
     MANIFEST_UNKNOWN), though manifests with `subject` are accepted. So the

@@ -95,11 +95,11 @@ impl GhcrStore {
     /// Signs everything written this run as one batch and pushes it.
     /// Returns the number of results published.
     pub fn publish(&self) -> Result<usize, String> {
-        let writer = self.writer.as_ref().ok_or("no writable namespace configured")?;
-        let pending: Vec<_> = std::mem::take(&mut *self.pending.lock().map_err(|_| "poisoned")?);
-        if pending.is_empty() {
+        if self.pending.lock().map_err(|_| "poisoned")?.is_empty() {
             return Ok(0);
         }
+        let writer = self.writer.as_ref().ok_or("results pending but no writable namespace configured")?;
+        let pending: Vec<_> = std::mem::take(&mut *self.pending.lock().map_err(|_| "poisoned")?);
         let mut pairs = Vec::new();
         let mut configs = Vec::new();
         for (action, size, result) in &pending {
