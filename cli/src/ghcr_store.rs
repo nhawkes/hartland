@@ -50,7 +50,7 @@ impl GhcrStore {
 
     fn fetch_blob(&self, hash: &str) -> Option<Vec<u8>> {
         for r in &self.readers {
-            if let Ok(b) = r.get_blob(hash) {
+            if let Ok(b) = get_blob_retrying(r, hash) {
                 // get_blob checks the digest; keep a local copy.
                 let _ = self.local.put_blob(hash, &b);
                 return Some(b);
@@ -64,7 +64,7 @@ impl GhcrStore {
         if let Some(p) = self.verified.lock().ok()?.get(envelope_hash) {
             return Some(p.clone());
         }
-        let bytes = reg.get_blob(envelope_hash).ok()?;
+        let bytes = get_blob_retrying(reg, envelope_hash).ok()?;
         let env: Envelope = serde_json::from_slice(&bytes).ok()?;
         let (statement, _signer) = crate::verify_envelope(&env, &self.jwks, &self.keyring).ok()?;
         let pairs: HashMap<String, String> =
@@ -88,7 +88,7 @@ impl GhcrStore {
         if pairs.get(action).map(String::as_str) != Some(config_hash) {
             return None;
         }
-        let bytes = reg.get_blob(config_hash).ok()?;
+        let bytes = get_blob_retrying(reg, config_hash).ok()?;
         re::ActionResult::decode(bytes.as_slice()).ok()
     }
 
@@ -116,13 +116,26 @@ impl GhcrStore {
         let envelope = serde_json::to_vec(&Envelope::new(&payload, token)).map_err(|e| e.to_string())?;
         let env_hash = writer.put_blob(&envelope)?;
 
-        for ((action, _, result), config) in pending.iter().zip(&configs) {
-            let config_hash = writer.put_blob(config)?;
+        // Upload every distinct blob once, in parallel (GHCR: ~1.1 s per small
+        // blob sequentially, ~90 ms effective at 16 in flight).
+        let mut referenced = Vec::new();
+        let mut all: BTreeSet<String> = BTreeSet::new();
+        for (_, _, result) in &pending {
+            let r = self.referenced_blobs(result)?;
+            all.extend(r.iter().cloned());
+            referenced.push(r);
+        }
+        let all: Vec<String> = all.into_iter().collect();
+        let sizes: HashMap<String, usize> = parallel_upload(writer, &self.local, &all)?;
+        for config in &configs {
+            writer.put_blob(config)?;
+        }
+
+        for (((action, _, _), config), refs) in pending.iter().zip(&configs).zip(&referenced) {
+            let config_hash = sha256_hex(config);
             let mut layers = Vec::new();
-            for hash in self.referenced_blobs(result)? {
-                let data = self.local.get_blob(&hash).ok_or_else(|| format!("output blob {hash} missing locally"))?;
-                writer.put_blob(&data)?;
-                layers.push(serde_json::json!({"mediaType": "application/octet-stream", "digest": format!("sha256:{hash}"), "size": data.len()}));
+            for hash in refs {
+                layers.push(serde_json::json!({"mediaType": "application/octet-stream", "digest": format!("sha256:{hash}"), "size": sizes[hash]}));
             }
             layers.push(serde_json::json!({"mediaType": ENVELOPE_MEDIA_TYPE, "digest": format!("sha256:{env_hash}"), "size": envelope.len()}));
             let manifest = serde_json::json!({
@@ -166,6 +179,47 @@ impl GhcrStore {
         out.remove(EMPTY_SHA256);
         Ok(out)
     }
+}
+
+const UPLOAD_PARALLELISM: usize = 16;
+const READ_ATTEMPTS: usize = 3;
+
+/// Uploads blobs from the local store; returns each blob's size.
+fn parallel_upload(writer: &Registry, local: &DiskStore, hashes: &[String]) -> Result<HashMap<String, usize>, String> {
+    let results: Vec<Result<(String, usize), String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..UPLOAD_PARALLELISM.min(hashes.len().max(1)))
+            .map(|t| {
+                s.spawn(move || {
+                    hashes
+                        .iter()
+                        .skip(t)
+                        .step_by(UPLOAD_PARALLELISM)
+                        .map(|h| {
+                            let data = local.get_blob(h).ok_or_else(|| format!("blob {h} missing locally"))?;
+                            writer.put_blob(&data)?;
+                            Ok((h.clone(), data.len()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_else(|_| vec![Err("upload thread panicked".to_string())])).collect()
+    });
+    results.into_iter().collect()
+}
+
+/// GHCR blob reads go via a redirect to separate storage; one early read
+/// failed transiently in testing, so reads are retried.
+fn get_blob_retrying(reg: &Registry, hash: &str) -> Result<Vec<u8>, String> {
+    let mut last = String::new();
+    for attempt in 0..READ_ATTEMPTS {
+        match reg.get_blob(hash) {
+            Ok(b) => return Ok(b),
+            Err(e) => last = e,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
+    }
+    Err(last)
 }
 
 impl Store for GhcrStore {
