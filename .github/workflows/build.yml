@@ -175,8 +175,33 @@ jobs:
           fi
       - name: Work
         shell: bash
-        run: bash hl/ci/attested-worker.sh hl
+        run: bash hl/ci/attested-worker.sh hl 2>&1 | tee "$RUNNER_TEMP/worker.log"
         env:
           BUILDER_SHA: ${{ steps.self.outputs.sha }}
           COORDINATOR: ${{ inputs.coordinator }}
           COORDINATOR_RUN: ${{ inputs.coordinator_run }}
+      # Workers' logs, one file per worker run, on a branch per coordinator
+      # run (attest-workers/<run>), so a failed join is visible.
+      - name: Publish log
+        if: always()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/worker.log"
+          [ -s "$log" ] || echo "no log: the worker failed before it started" > "$log"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          url="https://github.com/$GITHUB_REPOSITORY"
+          branch="attest-workers/${{ inputs.coordinator_run }}"
+          mkdir logs && cd logs && git init -q
+          for attempt in 1 2 3 4 5; do
+            # On top of what other workers pushed, if anything.
+            if git -c http.extraheader="$auth" fetch -q --depth 1 "$url" "$branch" 2>/dev/null; then
+              git reset -q --hard FETCH_HEAD
+            fi
+            cp "$log" "$GITHUB_RUN_ID.log"
+            git add "$GITHUB_RUN_ID.log"
+            git -c user.name=hartland -c user.email=hartland@invalid commit -qm "worker run $GITHUB_RUN_ID"
+            git -c http.extraheader="$auth" push -q "$url" "HEAD:refs/heads/$branch" && break
+            sleep $((attempt * 2))
+          done
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
