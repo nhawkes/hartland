@@ -57,10 +57,11 @@ serve() { # store-dir [--write ns]
 # buck2 runs as hlbuild in a copy of the caller's checkout it owns, with the
 # attested settings forced regardless of the caller's own config.
 build() { # label
-    local tree="$work/build-$1"
-    sudo rm -rf "$tree" && cp -a "$caller" "$tree"
-    cp "$caller/mode/attested.bcfg" "$tree/.buckconfig.local" 2>/dev/null || true
-    cat >> "$tree/.buckconfig.local" <<'CFG'
+    # Under hlbuild's home: $work is private to the runner uid.
+    local tree="/home/hlbuild/build-$1"
+    sudo rm -rf "$tree" && sudo cp -a "$caller" "$tree"
+    sudo cp "$caller/mode/attested.bcfg" "$tree/.buckconfig.local" 2>/dev/null || true
+    sudo tee -a "$tree/.buckconfig.local" >/dev/null <<'CFG'
 
 [hartland]
 remote_execution = true
