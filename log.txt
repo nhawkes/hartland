@@ -1,0 +1,27 @@
+== write: store a result, publish on SIGTERM
+hartland proxy (registry) listening on 127.0.0.1:8981
+stored 681b12791e05458e5204bf167e5f928e72846501815e64c9e6443a27722aa285
+PASS: /home/runner/work/hartland/hartland/src/cli/target/release/hartland proxy ac-put --addr http://127.0.0.1:8981 --action w-42487347111
+hartland proxy: shutting down; publishing pending results
+hartland proxy: published 1 signed result(s)
+== read: fresh proxy, trusting keyring
+hartland proxy (registry) listening on 127.0.0.1:8981
+681b12791e05458e5204bf167e5f928e72846501815e64c9e6443a27722aa285 found
+PASS: /home/runner/work/hartland/hartland/src/cli/target/release/hartland proxy ac-get --addr http://127.0.0.1:8981 --action w-42487347111 --expect found
+hartland proxy: shutting down; publishing pending results
+hartland proxy: publish failed: no writable namespace configured
+== forge: copy the signed entry to another action's tag
+sha256:f99418c63ea9bd8af91ab3a6c3d156fe18438250110b75770be76d1f8edf7d4b
+PASS: /home/runner/work/hartland/hartland/src/cli/target/release/hartland oci retag --registry ghcr.io --repo nhawkes/hartland-spike-cache --from 681b12791e05458e5204bf167e5f928e72846501815e64c9e6443a27722aa285 --to 0ba46d0dfdf9d70f2ca4f3a98b6ceb25cad6843a0c23b6ba194cc539b4db56df
+hartland proxy (registry) listening on 127.0.0.1:8981
+0ba46d0dfdf9d70f2ca4f3a98b6ceb25cad6843a0c23b6ba194cc539b4db56df missing
+PASS: /home/runner/work/hartland/hartland/src/cli/target/release/hartland proxy ac-get --addr http://127.0.0.1:8981 --action forged-42487347111 --expect missing
+hartland proxy: shutting down; publishing pending results
+hartland proxy: publish failed: no writable namespace configured
+== trust: keyring that does not trust this workflow commit
+hartland proxy (registry) listening on 127.0.0.1:8981
+681b12791e05458e5204bf167e5f928e72846501815e64c9e6443a27722aa285 missing
+PASS: /home/runner/work/hartland/hartland/src/cli/target/release/hartland proxy ac-get --addr http://127.0.0.1:8981 --action w-42487347111 --expect missing
+hartland proxy: shutting down; publishing pending results
+hartland proxy: publish failed: no writable namespace configured
+summary: ALL PASS
