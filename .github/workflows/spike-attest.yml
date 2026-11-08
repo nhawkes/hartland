@@ -1,0 +1,40 @@
+# Spike: build the hartland CLI on a hosted runner and sign a sample batch.
+# The envelope is committed to spike/attest-results for local verification.
+name: spike-attest
+on:
+  push:
+    branches: [spike/attest]
+permissions:
+  contents: write
+  id-token: write
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Fetch this commit
+        run: |
+          git init -q src && cd src
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Build
+        run: cd src/cli && cargo build --locked --release -q
+      - name: Sign a sample batch
+        run: |
+          mkdir -p results
+          cp src/spikes/attest/sample-results.json results/
+          src/cli/target/release/hartland attest sign --results results/sample-results.json --out results/envelope.json
+      - name: Publish results
+        if: always()
+        run: |
+          cd results
+          git init -q && git checkout -q -b results
+          git -c user.name=spike -c user.email=spike@invalid add -A
+          git -c user.name=spike -c user.email=spike@invalid commit -qm "spike-attest results for $GITHUB_SHA (run $GITHUB_RUN_ID)"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" HEAD:refs/heads/spike/attest-results
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
