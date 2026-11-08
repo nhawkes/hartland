@@ -7,6 +7,7 @@ pub mod github;
 pub mod http;
 pub mod jwt;
 pub mod keyring;
+pub mod l1;
 pub mod oci;
 pub mod package;
 pub mod proxy;

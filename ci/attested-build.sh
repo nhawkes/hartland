@@ -43,9 +43,20 @@ if os.path.exists(extra):
 print(json.dumps({"builders": [{"workflow": wf, "commits": commits}]}))
 PY
 
+# First tier (Actions cache) and promotion: everything from the default
+# branch goes to the registry; elsewhere only first-tier results reused.
+l1_args=()
+if [ -n "${HARTLAND_L1:-}" ]; then
+    mkdir -p "$HARTLAND_L1"
+    promote=reused
+    [ "${GITHUB_REF:-}" = "refs/heads/${DEFAULT_BRANCH:-main}" ] && promote=all
+    l1_args=(--l1 "$HARTLAND_L1" --promote "$promote")
+    log "first tier $HARTLAND_L1 ($(find "$HARTLAND_L1/batches" -name '*.envelope' 2>/dev/null | wc -l) batches restored); promote $promote"
+fi
+
 serve() { # store-dir [--write ns]
     local dir="$1"; shift
-    "$hartland" proxy serve --dir "$dir" --listen 127.0.0.1:8980 --execute sandbox \
+    "$hartland" proxy serve --dir "$dir" --listen 127.0.0.1:8980 --execute sandbox "${l1_args[@]}" \
         --registry ghcr.io --read "$namespace" --keyring "$work/keyring.json" \
         --jwks "$hl/keys/github-actions-jwks.json" --publish-every 3600 "$@" \
         >>"$out/proxy.log" 2>&1 &

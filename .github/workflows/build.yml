@@ -55,11 +55,27 @@ jobs:
           git -c http.extraheader="$auth" submodule update -q --init --depth 1
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      # First cache tier: signed batches and their blobs in GitHub's Actions
+      # cache (untrusted transport: verified on load like everything else).
+      - name: Restore first-tier cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/hartland-l1
+          key: hartland-l1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: hartland-l1-
       - name: Attested build
         shell: bash
         run: bash hl/ci/attested-build.sh hl caller "${{ inputs.targets }}" results
         env:
           BUILDER_SHA: ${{ steps.self.outputs.sha }}
+          HARTLAND_L1: ${{ runner.temp }}/hartland-l1
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      - name: Save first-tier cache
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/hartland-l1
+          key: hartland-l1-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Publish logs
         if: always() && inputs.publish_results
         shell: bash

@@ -221,3 +221,82 @@ fn package_rejects_action_batch_as_package() {
     assert!(hartland::package::verify(&envelope_with(|_| {}), &jwks(), &keyring()).unwrap_err().contains("bad package statement")
         || hartland::package::verify(&envelope_with(|_| {}), &jwks(), &keyring()).unwrap_err().contains("not a hartland package"));
 }
+
+// ---- first tier (Actions-cache directory) ----
+
+fn signed_batch(results: &[(String, hartland::reapi::re::ActionResult)]) -> (String, Vec<u8>) {
+    use prost::Message as _;
+    let pairs = results
+        .iter()
+        .map(|(a, r)| {
+            let b = r.encode_to_vec();
+            ActionResult { action: Digest { hash: a.clone(), size: 1 }, result: Digest { hash: hartland::attest::sha256_hex(&b), size: b.len() as u64 } }
+        })
+        .collect();
+    let p = hartland::statement_bytes(&Statement::new(pairs));
+    let env = serde_json::to_vec(&Envelope::new(&p, sign(json!({"alg": "RS256", "kid": KID}), claims(&audience_for(&p))))).unwrap();
+    (hartland::attest::sha256_hex(&env), env)
+}
+
+fn result_with(out: &[u8]) -> hartland::reapi::re::ActionResult {
+    use hartland::reapi::re;
+    re::ActionResult {
+        output_files: vec![re::OutputFile {
+            path: "o".into(),
+            digest: Some(re::Digest { hash: hartland::attest::sha256_hex(out), size_bytes: out.len() as i64 }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn l1_round_trip_and_tamper_resistance() {
+    use hartland::l1::{L1, bundle_bytes};
+    let dir = std::env::temp_dir().join(format!("hartland-l1-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let l1 = L1::open(dir.clone()).await.unwrap();
+
+    let (a1, a2) = (digest('a').hash, digest('b').hash);
+    let (o1, o2) = (b"out one".to_vec(), b"out two".to_vec());
+    let (r1, r2) = (result_with(&o1), result_with(&o2));
+    let (h1, h2) = (hartland::attest::sha256_hex(&o1), hartland::attest::sha256_hex(&o2));
+    let (env_hash, env) = signed_batch(&[(a1.clone(), r1.clone()), (a2.clone(), r2.clone())]);
+
+    // A forged third entry (not in the signed statement) and a tampered
+    // second entry must be dropped; the genuine first entry survives.
+    let forged = result_with(b"evil");
+    let bundle = bundle_bytes(&[
+        (a1.clone(), r1.clone(), vec![h1.clone()]),
+        (a2.clone(), result_with(b"tampered"), vec![h2.clone()]),
+        (digest('c').hash, forged, vec![]),
+    ])
+    .unwrap();
+    l1.put_blob(&h1, &o1).await.unwrap();
+    l1.put_blob(&h2, &o2).await.unwrap();
+    l1.write_batch(&env_hash, &env, &bundle).await.unwrap();
+
+    let batches = l1.load(&jwks(), &keyring()).await;
+    assert_eq!(batches.len(), 1);
+    let actions: Vec<&String> = batches[0].results.iter().map(|(a, _, _)| a).collect();
+    assert_eq!(actions, vec![&a1], "only the genuine signed entry is accepted");
+
+    // An untrusted builder's batch is ignored entirely.
+    let other = Keyring { builders: vec![Builder { workflow: WORKFLOW.into(), commits: vec!["0".repeat(40)] }] };
+    assert!(l1.load(&jwks(), &other).await.is_empty());
+
+    // A tampered blob reads as absent.
+    assert_eq!(l1.get_blob(&h1).await.as_deref(), Some(&o1[..]));
+    let p = dir.join("blobs").join(&h1[..2]).join(&h1);
+    std::fs::write(&p, b"changed").unwrap();
+    assert!(l1.get_blob(&h1).await.is_none());
+
+    // Pruning keeps referenced blobs and drops unreferenced ones.
+    let stray = b"stray".to_vec();
+    let hs = hartland::attest::sha256_hex(&stray);
+    l1.put_blob(&hs, &stray).await.unwrap();
+    l1.prune(10, &jwks(), &keyring()).await.unwrap();
+    assert!(!l1.has_blob(&hs).await, "unreferenced blob pruned");
+    assert!(l1.has_blob(&h1).await, "referenced blob kept");
+    let _ = std::fs::remove_dir_all(&dir);
+}

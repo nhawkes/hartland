@@ -23,7 +23,8 @@ const USAGE: &str = "usage:
   hartland sandbox run --input <dir> --collect <dir> [--output <path>]... [--env K=V]... [--no-drop-user] -- <argv>...
       Run one action in the sandbox; copy declared outputs to --collect.
   hartland proxy serve --dir <store> --listen <addr:port> [--execute sandbox|unprivileged]
-                       [--registry ghcr.io --read ns[,ns] [--write ns] --keyring k --jwks j [--publish-every secs]]
+                       [--registry ghcr.io --read ns[,ns] [--write ns] --keyring k --jwks j [--publish-every secs]
+                        [--l1 <dir>] [--promote all|reused|none]]
       Serve the Remote Execution API.
   hartland proxy check|put|ac-put|ac-get --addr <url> ...
       Test clients.
@@ -285,7 +286,12 @@ async fn ghcr_store(f: &HashMap<String, String>, disk: hartland::proxy::DiskStor
     };
     let keyring: Keyring = read_json(need(f, "keyring")?).await?;
     let jwks: Jwks = read_json(need(f, "jwks")?).await?;
-    Ok(hartland::ghcr_store::GhcrStore::new(disk, readers, writer, keyring, jwks))
+    let l1 = match f.get("l1") {
+        Some(dir) => Some(hartland::l1::L1::open(dir.into()).await?),
+        None => None,
+    };
+    let promote: hartland::ghcr_store::Promote = f.get("promote").map(|p| p.parse()).transpose()?.unwrap_or(hartland::ghcr_store::Promote::All);
+    Ok(hartland::ghcr_store::GhcrStore::new(disk, readers, writer, keyring, jwks).with_l1(l1, promote))
 }
 
 fn report_publish(r: Result<usize, String>) {
@@ -305,8 +311,8 @@ async fn proxy_serve(f: &HashMap<String, String>) -> Result<(), String> {
         return with_execution(f, hartland::proxy::Proxy::new(store.clone()), store).await?.serve(addr).await;
     }
     let store = Arc::new(ghcr_store(f, disk).await?);
-    let loaded = store.load_index().await;
-    eprintln!("hartland proxy: {loaded} signed result(s) available from registry indexes");
+    let loaded = store.load().await;
+    eprintln!("hartland proxy: {loaded} verified result(s) available from the first tier and registry indexes");
     let every: u64 = f.get("publish-every").map(|s| s.parse()).transpose().map_err(|e| format!("--publish-every: {e}"))?.unwrap_or(300);
     eprintln!("hartland proxy (registry) listening on {addr}");
     let dyn_store: Arc<dyn hartland::proxy::Store> = store.clone();
