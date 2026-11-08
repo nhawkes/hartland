@@ -1,0 +1,36 @@
+# Spike: can GitHub OIDC tokens sign our statements, and can a hosted runner
+# isolate build actions from the token? Results are committed to the
+# spike/oidc-results branch. No third-party actions are used.
+name: spike-oidc
+on:
+  push:
+    branches: [spike/oidc]
+permissions:
+  contents: write
+  id-token: write
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch this commit
+        run: |
+          git init -q src && cd src
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Probe
+        run: bash src/spikes/oidc/probe.sh results
+      - name: Publish results
+        if: always()
+        run: |
+          cd results
+          git init -q && git checkout -q -b results
+          git -c user.name=spike -c user.email=spike@invalid add -A
+          git -c user.name=spike -c user.email=spike@invalid commit -qm "spike-oidc results for $GITHUB_SHA (run $GITHUB_RUN_ID)"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" HEAD:refs/heads/spike/oidc-results
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
