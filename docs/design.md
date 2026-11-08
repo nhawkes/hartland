@@ -60,6 +60,9 @@ in CI machines.
 - **No source VFS yet.** `pinned_archive` unpacks tarballs into buck2 output
   directories, and rules reach into them by path projection. Patches are
   build steps, not an L1 layer.
-- **musl's file list** (`pkg/musl/srcs.bzl`) came from a script run outside
-  the build (`gen.py`), not from a per-package generator over the VFS, and
-  it has not been verified against upstream with nm, abidiff or libc-test.
+- **musl's file list** is no longer committed. A busybox action lists the
+  unpacked tree, and a dynamic action applies musl's Makefile selection
+  rules (written in Starlark in `pkg/musl/musl.bzl`) and declares one
+  compile per source. That puts the selection inside the build graph rather
+  than in a generated BUCK file over the VFS. It has not yet been verified
+  against upstream with nm, abidiff or libc-test.
