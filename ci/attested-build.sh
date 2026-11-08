@@ -32,16 +32,7 @@ id hlbuild >/dev/null 2>&1 || sudo useradd --create-home --shell /usr/sbin/nolog
 # Trust: results signed by this builder at this commit (and any listed in
 # hartland's keys/builders.json, if present).
 work="$(mktemp -d)"
-python3 - "$builder" "$BUILDER_SHA" "$hl/keys/builders.json" > "$work/keyring.json" <<'PY'
-import json, os, sys
-wf, sha, extra = sys.argv[1:4]
-commits = [sha]
-if os.path.exists(extra):
-    for b in json.load(open(extra)).get("builders", []):
-        if b["workflow"] == wf:
-            commits += [c for c in b["commits"] if c not in commits]
-print(json.dumps({"builders": [{"workflow": wf, "commits": commits}]}))
-PY
+python3 "$hl/ci/make-keyring.py" "$builder" "$BUILDER_SHA" "$hl/keys/builders.json" > "$work/keyring.json"
 
 # First tier (Actions cache) and promotion: everything from the default
 # branch goes to the registry; elsewhere only first-tier results reused.
@@ -97,7 +88,15 @@ CFG
 }
 
 log "phase 1: build, execute in the sandbox, sign, publish"
-serve "$work/store1" "$promote" --write "$namespace"
+# Scale-out in phase 1: workers are dispatched as runs of the calling
+# workflow only while actions wait for a slot.
+scale_args=()
+if [ "${MAX_WORKERS:-0}" -gt 0 ] && [ -n "${GITHUB_WORKFLOW_REF:-}" ]; then
+    caller_workflow="${GITHUB_WORKFLOW_REF%@*}"
+    scale_args=(--worker-workflow "${caller_workflow##*/}" --worker-ref "$GITHUB_REF_NAME" --max-workers "$MAX_WORKERS")
+    log "scale-out: up to $MAX_WORKERS workers of ${caller_workflow##*/} on $GITHUB_REF_NAME"
+fi
+serve "$work/store1" "$promote" --write "$namespace" "${scale_args[@]}"
 build first && log "first build succeeded" || { log "first build FAILED"; kill -TERM "$proxy"; wait "$proxy" || true; exit 1; }
 
 # Package attestations: one signed statement per target, binding its output

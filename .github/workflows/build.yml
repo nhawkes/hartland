@@ -2,8 +2,13 @@
 #
 #   jobs:
 #     attest:
-#       permissions: {contents: read, packages: write, id-token: write}
+#       permissions: {contents: read, packages: write, id-token: write, actions: write}
 #       uses: nhawkes/hartland/.github/workflows/build.yml@<commit>
+#
+# As the coordinator (role: coordinator, the default) it runs the build and
+# dispatches worker runs of the caller's workflow on demand, passing
+# role: worker and its own key and run. A worker joins that coordinator,
+# runs the actions it is sent in the sandbox, and leaves when idle.
 #
 # Keyrings trust this file at pinned commits on GitHub-hosted runners. All
 # trusted code is fetched from hartland at the builder's own commit, read from
@@ -20,8 +25,25 @@ on:
         description: push logs to the caller's attest-results branch (needs contents write)
         type: boolean
         default: false
+      role:
+        description: coordinator (build, dispatch workers) or worker (dispatched)
+        type: string
+        default: coordinator
+      coordinator:
+        description: "worker only: the coordinator's public key"
+        type: string
+        default: ""
+      coordinator_run:
+        description: "worker only: the coordinator's run id"
+        type: string
+        default: ""
+      max_workers:
+        description: most workers the coordinator dispatches at once (0 disables scale-out)
+        type: number
+        default: 4
 jobs:
   build:
+    if: inputs.role != 'worker'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -70,6 +92,10 @@ jobs:
           BUILDER_SHA: ${{ steps.self.outputs.sha }}
           HARTLAND_L1: ${{ runner.temp }}/hartland-l1
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MAX_WORKERS: ${{ inputs.max_workers }}
+          # Only the coordinator process sees it (buck2 and actions run with
+          # empty environments): it dispatches workers.
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Save first-tier cache
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -88,3 +114,32 @@ jobs:
           git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" HEAD:refs/heads/attest-results
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+  worker:
+    if: inputs.role == 'worker'
+    runs-on: ubuntu-24.04
+    # A hard limit; a worker normally leaves after a minute without work.
+    timeout-minutes: 90
+    steps:
+      - name: Identify this builder
+        id: self
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=hartland-builder-identity" \
+            | python3 -c 'import base64,json,sys; t=json.load(sys.stdin)["value"].split(".")[1]; t+="="*(-len(t)%4); c=json.loads(base64.urlsafe_b64decode(t)); assert c["job_workflow_ref"].startswith("nhawkes/hartland/.github/workflows/build.yml@"), c["job_workflow_ref"]; print(c["job_workflow_sha"])')"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Fetch hartland at the builder commit
+        shell: bash
+        run: |
+          git init -q hl && cd hl
+          git fetch -q --depth 1 https://github.com/nhawkes/hartland "${{ steps.self.outputs.sha }}"
+          git checkout -q FETCH_HEAD
+      - name: Work
+        shell: bash
+        run: bash hl/ci/attested-worker.sh hl
+        env:
+          BUILDER_SHA: ${{ steps.self.outputs.sha }}
+          COORDINATOR: ${{ inputs.coordinator }}
+          COORDINATOR_RUN: ${{ inputs.coordinator_run }}
