@@ -3,6 +3,8 @@
     {
       "workflow": "nhawkes/hartland/.github/workflows/build.yml",
       "commits": [
+        "863eeeef24c84a59898c42e944174b965372cae3",
+        "2533ca10bffb3653f6370154cfbf8ab19df47c95",
         "2eb5c71c6cb0a2316f52f362625b5e868c29510a",
         "713f2b56feff4605ecefc41bcd2036abf65261a2",
         "dd3f4693ac64eb106fcc825ef49844acfb12ca59",
