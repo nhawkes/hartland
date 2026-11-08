@@ -6,21 +6,22 @@
 //!     /proc entries or the runner's home);
 //!   * under bubblewrap with every namespace unshared: no network, own PIDs;
 //!   * on an empty tmpfs root with only its scratch directory (at /work),
-//!     /proc, /dev and /tmp: no host files at all. Actions run pinned static
-//!     tools that arrive as inputs, so they need nothing from the host;
+//!     read-only input mounts, /proc, /dev and /tmp: no host files at all.
+//!     Actions run pinned static tools that arrive as inputs;
 //!   * with an empty environment apart from what the action declares.
 //!
 //! Ubuntu 24.04 runners block unprivileged user namespaces via AppArmor;
 //! `setup` lifts that (the runner user has sudo) and creates the uid.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use tokio::process::Command;
 
 pub const SANDBOX_USER: &str = "hlsandbox";
 pub const WORKDIR: &str = "/work";
 
 pub struct Spec<'a> {
-    /// Directory whose contents become the action's working directory.
+    /// Directory whose contents become the action's working root.
     pub input: &'a Path,
     /// argv[0] is resolved inside the sandbox, e.g. `/work/bin/sh`.
     pub argv: &'a [String],
@@ -31,8 +32,7 @@ pub struct Spec<'a> {
     pub outputs: &'a [String],
     /// Where collected outputs are copied, at the same relative paths.
     pub collect: &'a Path,
-    /// Run as `SANDBOX_USER` via sudo. False only for local development,
-    /// where the caller is already unprivileged.
+    /// Run as `SANDBOX_USER` via sudo. False only for local development.
     pub drop_user: bool,
     /// `input` is a private directory the caller will discard: use it as the
     /// scratch directory in place instead of copying it.
@@ -49,8 +49,8 @@ pub struct Outcome {
     pub missing: Vec<String>,
 }
 
-fn run(cmd: &mut Command) -> Result<(), String> {
-    let out = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
+async fn run(cmd: &mut Command) -> Result<(), String> {
+    let out = cmd.output().await.map_err(|e| format!("{cmd:?}: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -58,8 +58,12 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
-fn sudo(args: &[&str]) -> Result<(), String> {
-    run(Command::new("sudo").arg("-n").args(args))
+async fn sudo(args: &[&str]) -> Result<(), String> {
+    run(Command::new("sudo").arg("-n").args(args)).await
+}
+
+async fn succeeds(cmd: &mut Command) -> bool {
+    matches!(cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().await, Ok(s) if s.success())
 }
 
 /// One-off runner preparation. Idempotent.
@@ -67,15 +71,13 @@ fn sudo(args: &[&str]) -> Result<(), String> {
 /// bubblewrap is not on the GitHub runner image, so it comes from Ubuntu's
 /// archive here. That widens the trust base to Ubuntu's mirror; replace with a
 /// pinned static build from our own toolchain.
-pub fn setup() -> Result<(), String> {
-    let have_bwrap = Command::new("bwrap").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status();
-    if !matches!(have_bwrap, Ok(s) if s.success()) {
-        sudo(&["apt-get", "install", "-qy", "bubblewrap"])?;
+pub async fn setup() -> Result<(), String> {
+    if !succeeds(Command::new("bwrap").arg("--version")).await {
+        sudo(&["apt-get", "install", "-qy", "bubblewrap"]).await?;
     }
-    sudo(&["sysctl", "-q", "kernel.apparmor_restrict_unprivileged_userns=0"])?;
-    let exists = Command::new("id").arg(SANDBOX_USER).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    if !matches!(exists, Ok(s) if s.success()) {
-        sudo(&["useradd", "--no-create-home", "--shell", "/usr/sbin/nologin", SANDBOX_USER])?;
+    sudo(&["sysctl", "-q", "kernel.apparmor_restrict_unprivileged_userns=0"]).await?;
+    if !succeeds(Command::new("id").arg(SANDBOX_USER)).await {
+        sudo(&["useradd", "--no-create-home", "--shell", "/usr/sbin/nologin", SANDBOX_USER]).await?;
     }
     Ok(())
 }
@@ -88,12 +90,7 @@ fn check_relative(p: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
-    // cp -a keeps modes and symlinks; the tree is ours (worker-owned) here.
-    run(Command::new("cp").arg("-a").arg(format!("{}/.", from.display())).arg(to))
-}
-
-pub fn exec(spec: &Spec) -> Result<Outcome, String> {
+pub async fn exec(spec: &Spec<'_>) -> Result<Outcome, String> {
     for o in spec.outputs {
         check_relative(o)?;
     }
@@ -103,36 +100,33 @@ pub fn exec(spec: &Spec) -> Result<Outcome, String> {
     if spec.argv.is_empty() {
         return Err("empty argv".to_string());
     }
-    let scratch = if spec.take_input { spec.input.to_path_buf() } else { make_scratch(&std::env::temp_dir())? };
-    let result = exec_in(spec, &scratch);
+    let scratch = if spec.take_input { spec.input.to_path_buf() } else { make_scratch(&std::env::temp_dir()).await? };
+    let result = exec_in(spec, &scratch).await;
     // Always reclaim and delete the scratch directory.
     if spec.drop_user {
-        let _ = sudo(&["rm", "-rf", &scratch.display().to_string()]);
+        let _ = sudo(&["rm", "-rf", &scratch.display().to_string()]).await;
     } else {
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = tokio::fs::remove_dir_all(&scratch).await;
     }
     result
 }
 
-fn make_scratch(base: &Path) -> Result<PathBuf, String> {
-    for n in 0..1000u32 {
-        let p = base.join(format!("hartland-action-{}-{n}", std::process::id()));
-        match std::fs::create_dir(&p) {
-            Ok(()) => return Ok(p),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("{}: {e}", p.display())),
-        }
-    }
-    Err("could not create scratch directory".to_string())
+async fn make_scratch(base: &Path) -> Result<PathBuf, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let p = base.join(format!("hartland-action-{}-{n}", std::process::id()));
+    tokio::fs::create_dir(&p).await.map_err(|e| format!("{}: {e}", p.display()))?;
+    Ok(p)
 }
 
-fn exec_in(spec: &Spec, scratch: &Path) -> Result<Outcome, String> {
+async fn exec_in(spec: &Spec<'_>, scratch: &Path) -> Result<Outcome, String> {
     let s = scratch.display().to_string();
     if !spec.take_input {
-        copy_tree(spec.input, scratch)?;
+        // cp -a keeps modes and symlinks; the tree is ours (worker-owned).
+        run(Command::new("cp").arg("-a").arg(format!("{}/.", spec.input.display())).arg(scratch)).await?;
     }
     if spec.drop_user {
-        sudo(&["chown", "-R", &format!("{SANDBOX_USER}:{SANDBOX_USER}"), &s])?;
+        sudo(&["chown", "-R", &format!("{SANDBOX_USER}:{SANDBOX_USER}"), &s]).await?;
     }
 
     let mut cmd = if spec.drop_user {
@@ -147,29 +141,29 @@ fn exec_in(spec: &Spec, scratch: &Path) -> Result<Outcome, String> {
     for (host, rel) in spec.ro_binds {
         cmd.arg("--ro-bind").arg(host).arg(format!("{WORKDIR}/{rel}"));
     }
-    cmd
-        .args(["--chdir", &format!("{WORKDIR}/{}", spec.workdir).trim_end_matches('/').to_string(), "--clearenv"]);
+    let chdir = format!("{WORKDIR}/{}", spec.workdir).trim_end_matches('/').to_string();
+    cmd.args(["--chdir", &chdir, "--clearenv"]);
     for (k, v) in spec.env {
         cmd.args(["--setenv", k, v]);
     }
-    cmd.arg("--").args(spec.argv).stdin(Stdio::null());
-    let out = cmd.output().map_err(|e| format!("cannot start sandbox: {e}"))?;
+    cmd.arg("--").args(spec.argv).stdin(Stdio::null()).kill_on_drop(true);
+    let out = cmd.output().await.map_err(|e| format!("cannot start sandbox: {e}"))?;
 
     if spec.drop_user {
-        let me = format!("{}:{}", uid(), gid());
-        sudo(&["chown", "-R", &me, &s])?;
+        let me = format!("{}:{}", id("-u").await, id("-g").await);
+        sudo(&["chown", "-R", &me, &s]).await?;
     }
     let mut missing = Vec::new();
     for o in spec.outputs {
         let src = scratch.join(spec.workdir).join(o);
         // symlink_metadata: never follow a link the action planted.
-        match std::fs::symlink_metadata(&src) {
+        match tokio::fs::symlink_metadata(&src).await {
             Ok(_) => {
                 let dst = spec.collect.join(o);
                 if let Some(parent) = dst.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| format!("{}: {e}", parent.display()))?;
                 }
-                run(Command::new("cp").arg("-a").arg(&src).arg(&dst))?;
+                run(Command::new("cp").arg("-a").arg(&src).arg(&dst)).await?;
             }
             Err(_) => missing.push(o.clone()),
         }
@@ -177,19 +171,9 @@ fn exec_in(spec: &Spec, scratch: &Path) -> Result<Outcome, String> {
     Ok(Outcome { exit_code: out.status.code().unwrap_or(-1), stdout: out.stdout, stderr: out.stderr, missing })
 }
 
-fn id_of(flag: &str) -> String {
-    Command::new("id")
-        .arg(flag)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
-}
-
-fn uid() -> String {
-    id_of("-u")
-}
-
-fn gid() -> String {
-    id_of("-g")
+async fn id(flag: &str) -> String {
+    match Command::new("id").arg(flag).output().await {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => String::new(),
+    }
 }

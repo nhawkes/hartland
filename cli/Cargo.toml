@@ -4,17 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1.92"
 base64 = "0.23.1"
+futures = "0.3.34"
 prost = "0.14.4"
 prost-types = "0.14.4"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2", "query"] }
 ring = "0.17.14"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "signal", "time", "sync"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "signal", "time", "sync", "process"] }
 tokio-stream = "0.1.19"
 tonic = "0.14.9"
 tonic-prost = "0.14.9"
-ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 
 [build-dependencies]
 protox = "0.10.0"

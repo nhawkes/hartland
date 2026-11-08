@@ -4,6 +4,7 @@ pub mod attest;
 pub mod execute;
 pub mod ghcr_store;
 pub mod github;
+pub mod http;
 pub mod jwt;
 pub mod keyring;
 pub mod oci;
