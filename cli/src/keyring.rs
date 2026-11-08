@@ -145,6 +145,8 @@ pub struct Claims {
     repository: Repository,
     sha: Option<GitSha>,
     run_id: String,
+    /// What started the run: `push`, `workflow_dispatch`, ...
+    event_name: String,
 }
 
 /// The facts a verified, trusted token establishes about who signed.
@@ -155,6 +157,7 @@ pub struct Signer {
     pub repository: Repository,
     pub source_commit: Option<GitSha>,
     pub run_id: String,
+    pub event: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +209,11 @@ impl Keyring {
     /// Accepts verified claims from a trusted builder on a hosted runner,
     /// bound to `audience` (an attestation's `Audience`, or any other
     /// binding such as a peer's endpoint key).
-    pub fn accept(&self, claims: &Claims, audience: &impl fmt::Display) -> Result<Signer, TrustError> {
+    pub fn accept(
+        &self,
+        claims: &Claims,
+        audience: &impl fmt::Display,
+    ) -> Result<Signer, TrustError> {
         if claims.aud != [audience.to_string()] {
             return Err(TrustError::Audience);
         }
@@ -231,6 +238,7 @@ impl Keyring {
             repository: claims.repository.clone(),
             source_commit: claims.sha,
             run_id: claims.run_id.clone(),
+            event: claims.event_name.clone(),
         })
     }
 }

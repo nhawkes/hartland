@@ -65,6 +65,7 @@ fn claims(payload: &[u8]) -> Value {
         "runner_environment": "github-hosted",
         "sha": SOURCE,
         "run_id": "123",
+        "event_name": "push",
         "iat": 1, "exp": 301,
     })
 }
@@ -518,4 +519,88 @@ fn keyring_file_format() {
         )
         .is_err()
     );
+}
+
+// ---- certified keys ----
+
+use hartland::cert::{Identity, KeyAudience};
+
+/// A key certified by a (test) token: the given claims with aud bound to it.
+fn certified(seed: u8, mutate: impl FnOnce(&mut Value)) -> Identity {
+    let id = Identity::from_seed([seed; 32]).unwrap();
+    let mut c = claims(b"");
+    c["aud"] = json!(KeyAudience(&id.public()).to_string());
+    mutate(&mut c);
+    let token = sign(header(), c);
+    id.with_certificate(token)
+}
+
+#[test]
+fn certified_key_signs_envelopes() {
+    let id = certified(1, |_| {});
+    let env = Envelope::signed_by(payload(), &id).unwrap();
+    let signed = verify(&env).unwrap();
+    assert_eq!(signed.signer.workflow.to_string(), WORKFLOW);
+    assert_eq!(signed.signer.event, "push");
+    // Round-trips through its wire form.
+    assert!(verify(&Envelope::parse(&env.to_bytes()).unwrap()).is_ok());
+    let v: Value = serde_json::from_slice(&env.to_bytes()).unwrap();
+    assert_eq!(
+        v["signatures"][0]["kind"],
+        json!("hartland-certified-key-v0")
+    );
+}
+
+#[test]
+fn certified_key_rejects_tampering_and_strangers() {
+    use hartland::cert::CertError;
+    let id = certified(1, |_| {});
+    let env = Envelope::signed_by(payload(), &id).unwrap();
+
+    // Payload changed after signing.
+    let changed = tampered(&env, |v| {
+        let mut other = payload();
+        other.push(b' ');
+        v["payload"] = json!(base64::engine::general_purpose::STANDARD.encode(other));
+    });
+    assert!(matches!(
+        sig_err(&changed),
+        SignatureError::Certificate(CertError::BadSignature)
+    ));
+
+    // Another key's certificate attached to this key's signature.
+    let other = certified(2, |_| {});
+    let swapped = tampered(&env, |v| {
+        v["signatures"][0]["certificate"] =
+            serde_json::to_value(other.certificate().unwrap()).unwrap();
+    });
+    assert!(matches!(
+        sig_err(&swapped),
+        SignatureError::Certificate(CertError::BadSignature)
+    ));
+
+    // A certificate whose audience names a different key.
+    let wrong_aud = certified(1, |c| {
+        c["aud"] = json!(KeyAudience(&other.certificate().unwrap().key).to_string())
+    });
+    let env = Envelope::signed_by(payload(), &wrong_aud).unwrap();
+    assert!(matches!(
+        sig_err(&env),
+        SignatureError::Certificate(CertError::Trust(TrustError::Audience))
+    ));
+
+    // An untrusted builder, and a self-hosted runner.
+    let untrusted = certified(1, |c| c["job_workflow_sha"] = json!("0".repeat(40)));
+    assert!(matches!(
+        sig_err(&Envelope::signed_by(payload(), &untrusted).unwrap()),
+        SignatureError::Certificate(CertError::Trust(TrustError::Untrusted(..)))
+    ));
+    let self_hosted = certified(1, |c| c["runner_environment"] = json!("self-hosted"));
+    assert!(matches!(
+        sig_err(&Envelope::signed_by(payload(), &self_hosted).unwrap()),
+        SignatureError::Certificate(CertError::Trust(TrustError::SelfHosted))
+    ));
+
+    // No certificate at all.
+    assert!(Envelope::signed_by(payload(), &Identity::from_seed([3; 32]).unwrap()).is_err());
 }

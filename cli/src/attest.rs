@@ -10,6 +10,7 @@
 //! `Batch` maps each action to its result, and a `Signed<T>` exists only
 //! once the envelope has verified against a keyring.
 
+use crate::cert::{CertError, Certificate, Identity, SignatureBytes};
 use crate::digest::{ActionId, Digest, Sha256};
 use crate::jwt::{self, Jwks};
 use crate::keyring::{Keyring, Signer, TrustError};
@@ -51,6 +52,8 @@ pub enum SignatureError {
     Jwt(#[from] jwt::JwtError),
     #[error(transparent)]
     Trust(#[from] TrustError),
+    #[error(transparent)]
+    Certificate(#[from] CertError),
 }
 
 /// The OIDC audience that binds a token to exact payload bytes.
@@ -232,19 +235,21 @@ impl From<Batch> for RawStatement {
 
 // ---- envelopes ------------------------------------------------------------
 
+/// One signature over an envelope's payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SignatureKind {
-    GithubActionsOidc,
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Signature {
+    /// A GitHub Actions OIDC token whose audience is the payload's digest.
+    GithubActionsOidc { token: String },
+    /// A key certified by a GitHub Actions OIDC token (see `cert`), and
+    /// that key's Ed25519 signature over the payload.
+    #[serde(rename = "hartland-certified-key-v0")]
+    CertifiedKey {
+        certificate: Certificate,
+        signature: SignatureBytes,
+    },
     #[serde(other)]
     Unsupported,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Signature {
-    pub kind: SignatureKind,
-    /// The GitHub Actions OIDC token (a JWT).
-    pub token: String,
 }
 
 /// The stored, signed form. `payload` is the exact statement bytes.
@@ -273,11 +278,26 @@ impl Envelope {
             media_type: MustBe!("application/vnd.hartland.attestation.v0+json"),
             payload_type: MustBe!("application/vnd.in-toto+json"),
             payload,
-            signatures: vec![Signature {
-                kind: SignatureKind::GithubActionsOidc,
-                token,
-            }],
+            signatures: vec![Signature::GithubActionsOidc { token }],
         }
+    }
+
+    /// Signs `payload` with a certified key.
+    pub fn signed_by(payload: Vec<u8>, identity: &Identity) -> Result<Envelope, CertError> {
+        let certificate = identity
+            .certificate()
+            .cloned()
+            .ok_or(CertError::Uncertified)?;
+        let signature = identity.sign(&payload);
+        Ok(Envelope {
+            media_type: MustBe!("application/vnd.hartland.attestation.v0+json"),
+            payload_type: MustBe!("application/vnd.in-toto+json"),
+            payload,
+            signatures: vec![Signature::CertifiedKey {
+                certificate,
+                signature,
+            }],
+        })
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Envelope, VerifyError> {
@@ -288,9 +308,10 @@ impl Envelope {
         serde_json::to_vec(self).expect("an envelope serialises")
     }
 
-    /// Some signature must be a GitHub Actions token, valid against the key
-    /// archive, bound to these exact payload bytes, and from a builder the
-    /// keyring trusts; then the payload must parse as `T`.
+    /// Some signature must come from a builder the keyring trusts, on a
+    /// hosted runner, and cover these exact payload bytes: either a token
+    /// whose audience is their digest, or a certified key's signature over
+    /// them. Then the payload must parse as `T`.
     pub fn verify<T: DeserializeOwned>(
         &self,
         jwks: &Jwks,
@@ -302,11 +323,19 @@ impl Envelope {
         let audience = Audience::of(&self.payload);
         let mut errors = Vec::new();
         for sig in &self.signatures {
-            let checked = match sig.kind {
-                SignatureKind::GithubActionsOidc => jwt::verify(&sig.token, jwks)
+            let checked = match sig {
+                Signature::GithubActionsOidc { token } => jwt::verify(token, jwks)
                     .map_err(SignatureError::from)
                     .and_then(|c| keyring.accept(&c, &audience).map_err(SignatureError::from)),
-                SignatureKind::Unsupported => Err(SignatureError::UnsupportedKind),
+                Signature::CertifiedKey {
+                    certificate,
+                    signature,
+                } => certificate
+                    .key
+                    .verify(&self.payload, signature)
+                    .and_then(|()| certificate.verify(jwks, keyring))
+                    .map_err(SignatureError::from),
+                Signature::Unsupported => Err(SignatureError::UnsupportedKind),
             };
             match checked {
                 Ok(signer) => {

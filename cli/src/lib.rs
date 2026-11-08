@@ -5,6 +5,7 @@
 pub mod attest;
 pub mod bundle;
 pub mod cas;
+pub mod cert;
 pub mod digest;
 pub mod execute;
 pub mod ghcr_store;
