@@ -30,7 +30,8 @@ pub trait Store: Send + Sync + 'static {
     /// `data` has already been checked against `hash`.
     fn put_blob(&self, hash: &str, data: &[u8]) -> Result<(), String>;
     fn get_action_result(&self, action: &str) -> Option<re::ActionResult>;
-    fn put_action_result(&self, action: &str, result: &re::ActionResult) -> Result<(), String>;
+    /// `action_size` is the size of the serialised Action, for signed statements.
+    fn put_action_result(&self, action: &str, action_size: i64, result: &re::ActionResult) -> Result<(), String>;
 }
 
 pub struct DiskStore {
@@ -77,7 +78,7 @@ impl Store for DiskStore {
         let bytes = std::fs::read(self.root.join("ac").join(action)).ok()?;
         re::ActionResult::decode(bytes.as_slice()).ok()
     }
-    fn put_action_result(&self, action: &str, result: &re::ActionResult) -> Result<(), String> {
+    fn put_action_result(&self, action: &str, _action_size: i64, result: &re::ActionResult) -> Result<(), String> {
         self.write_atomic(&self.root.join("ac").join(action), &result.encode_to_vec())
     }
 }
@@ -219,17 +220,17 @@ impl ActionCache for Proxy {
 
     async fn update_action_result(&self, req: Request<re::UpdateActionResultRequest>) -> Result<Response<re::ActionResult>, Status> {
         let req = req.into_inner();
-        let (hash, _) = check_digest(&req.action_digest)?;
+        let (hash, size) = check_digest(&req.action_digest)?;
         let result = req.action_result.ok_or_else(|| Status::invalid_argument("missing action_result"))?;
         if !outputs_present(&*self.store, &result) {
             return Err(Status::failed_precondition("action result references blobs not in the CAS"));
         }
-        self.store.put_action_result(&hash, &result).map_err(Status::internal)?;
+        self.store.put_action_result(&hash, size, &result).map_err(Status::internal)?;
         Ok(Response::new(result))
     }
 }
 
-fn outputs_present(store: &dyn Store, r: &re::ActionResult) -> bool {
+pub fn outputs_present(store: &dyn Store, r: &re::ActionResult) -> bool {
     let digests = r
         .output_files
         .iter()

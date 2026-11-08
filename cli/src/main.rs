@@ -97,6 +97,40 @@ fn sandbox_run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn report_publish(r: Result<Result<usize, String>, tokio::task::JoinError>) {
+    match r {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => eprintln!("hartland proxy: published {n} signed result(s)"),
+        Ok(Err(e)) => eprintln!("hartland proxy: publish failed: {e}"),
+        Err(e) => eprintln!("hartland proxy: publish panicked: {e}"),
+    }
+}
+
+/// Registry-backed store. --registry ghcr.io --read owner/repo[,owner/repo...]
+/// [--write owner/repo] --keyring k.json --jwks j.json; credentials from
+/// REGISTRY_USER / REGISTRY_PASSWORD (in Actions: github.actor / github.token).
+fn ghcr_store(f: &HashMap<String, String>, disk: hartland::proxy::DiskStore) -> Result<hartland::ghcr_store::GhcrStore, String> {
+    use hartland::oci::Registry;
+    let host = need(f, "registry")?;
+    let user = std::env::var("REGISTRY_USER").ok();
+    let pass = std::env::var("REGISTRY_PASSWORD").ok();
+    let open = |repo: &str| -> Result<Registry, String> {
+        let mut r = Registry::new(host, repo);
+        if let (Some(u), Some(p)) = (&user, &pass) {
+            r.login(host, u, p)?;
+        }
+        Ok(r)
+    };
+    let mut readers = Vec::new();
+    for repo in need(f, "read")?.split(',').filter(|s| !s.is_empty()) {
+        readers.push(open(repo)?);
+    }
+    let writer = f.get("write").map(|w| open(w)).transpose()?;
+    let keyring: Keyring = read_json(need(f, "keyring")?)?;
+    let jwks: Jwks = read_json(need(f, "jwks")?)?;
+    Ok(hartland::ghcr_store::GhcrStore::new(disk, readers, writer, keyring, jwks))
+}
+
 /// Spike: how well does a registry (GHCR) work as an action cache?
 /// Credentials come from REGISTRY_USER / REGISTRY_PASSWORD.
 fn oci_probe(f: &HashMap<String, String>) -> Result<(), String> {
@@ -277,11 +311,40 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "proxy serve" => {
             let f = flags(rest)?;
-            let store = hartland::proxy::DiskStore::new(need(&f, "dir")?.into())?;
+            let disk = hartland::proxy::DiskStore::new(need(&f, "dir")?.into())?;
             let addr = need(&f, "listen")?.parse().map_err(|e| format!("--listen: {e}"))?;
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            eprintln!("hartland proxy listening on {addr}");
-            return rt.block_on(hartland::proxy::Proxy::new(std::sync::Arc::new(store)).serve(addr));
+            if f.get("registry").is_none() {
+                eprintln!("hartland proxy (disk) listening on {addr}");
+                return rt.block_on(hartland::proxy::Proxy::new(std::sync::Arc::new(disk)).serve(addr));
+            }
+            let store = std::sync::Arc::new(ghcr_store(&f, disk)?);
+            let every: u64 = f.get("publish-every").map(|s| s.parse()).transpose().map_err(|e| format!("--publish-every: {e}"))?.unwrap_or(300);
+            eprintln!("hartland proxy (registry) listening on {addr}");
+            return rt.block_on(async move {
+                let serve = hartland::proxy::Proxy::new(store.clone()).serve(addr);
+                let publisher = store.clone();
+                let periodic = async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(every.max(1)));
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        let s = publisher.clone();
+                        report_publish(tokio::task::spawn_blocking(move || s.publish()).await);
+                    }
+                };
+                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| e.to_string())?;
+                tokio::select! {
+                    r = serve => r?,
+                    _ = periodic => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+                eprintln!("hartland proxy: shutting down; publishing pending results");
+                let s = store.clone();
+                report_publish(tokio::task::spawn_blocking(move || s.publish()).await);
+                Ok(())
+            });
         }
         _ => {}
     }

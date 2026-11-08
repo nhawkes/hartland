@@ -1,6 +1,7 @@
 //! Hartland: attested builds anchored in GitHub-hosted runners.
 
 pub mod attest;
+pub mod ghcr_store;
 pub mod github;
 pub mod jwt;
 pub mod keyring;
