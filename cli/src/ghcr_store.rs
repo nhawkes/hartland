@@ -59,7 +59,7 @@ pub struct GhcrStore {
     known: Mutex<std::collections::HashSet<String>>,
     /// Results served via per-action lookup this run, grouped by the envelope
     /// that signed them: published as bundles so the index covers them too.
-    reindex: Mutex<HashMap<String, Vec<(String, re::ActionResult)>>>,
+    reindex: Mutex<HashMap<String, HashMap<String, re::ActionResult>>>,
 }
 
 /// One batch's results, so readers need one request per batch rather than a
@@ -206,8 +206,13 @@ impl GhcrStore {
         if !self.prefetch(&result).await {
             return None;
         }
+        // buck2 asks twice per action (GetActionResult, then Execute): serve
+        // the second from memory, and index each action once.
         if let Ok(mut r) = self.reindex.lock() {
-            r.entry(env_hash.to_string()).or_default().push((action.to_string(), result.clone()));
+            r.entry(env_hash.to_string()).or_default().insert(action.to_string(), result.clone());
+        }
+        if let Ok(mut idx) = self.indexed.lock() {
+            idx.insert(action.to_string(), result.clone());
         }
         Some(result)
     }
@@ -216,8 +221,10 @@ impl GhcrStore {
     /// envelopes, so the next reader finds them in the index. Nothing new is
     /// trusted: readers verify every entry against the original envelope.
     async fn publish_reindex(&self, writer: &Registry) -> Result<usize, String> {
-        let groups: Vec<(String, Vec<(String, re::ActionResult)>)> =
-            std::mem::take(&mut *self.reindex.lock().map_err(|_| "poisoned")?).into_iter().collect();
+        let groups: Vec<(String, Vec<(String, re::ActionResult)>)> = std::mem::take(&mut *self.reindex.lock().map_err(|_| "poisoned")?)
+            .into_iter()
+            .map(|(env, m)| (env, m.into_iter().collect()))
+            .collect();
         let mut n = 0;
         for (env_hash, entries) in groups {
             let envelope = self.local.get_blob(&env_hash).await;
