@@ -162,6 +162,12 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
   Next run (builder 2288dd1): first tier verified 1364 results in ~1.5 s,
   the registry index read added ~1.5 s, nothing re-promoted; phase 1
   (incl. package attestations) ~11 s, fresh-proxy rebuild ~8 s, 100% hits.
+- Off the critical path: the proxy serves from the first tier as soon as
+  it is loaded and reads registry indexes in the background (a first-tier
+  miss waits for them). Publishing signs and saves to the first tier, then
+  queues the registry writes in the first tier's outbox; `hartland proxy
+  promote` drains it in the background while the job carries on, and an
+  outbox that failed to drain travels in the Actions cache to the next run.
 
 - Package attestations (hartland-packages run 42492602972, builder
   1bc0a13): one statement per target, subjects = output files by sha256,

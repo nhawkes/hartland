@@ -45,20 +45,22 @@ PY
 
 # First tier (Actions cache) and promotion: everything from the default
 # branch goes to the registry; elsewhere only first-tier results reused.
-l1_args=()
+registry_args=(--registry ghcr.io --read "$namespace" --keyring "$work/keyring.json" --jwks "$hl/keys/github-actions-jwks.json")
+promote=none
 if [ -n "${HARTLAND_L1:-}" ]; then
     mkdir -p "$HARTLAND_L1"
+    registry_args+=(--l1 "$HARTLAND_L1")
     promote=reused
     [ "${GITHUB_REF:-}" = "refs/heads/${DEFAULT_BRANCH:-main}" ] && promote=all
-    l1_args=(--l1 "$HARTLAND_L1" --promote "$promote")
     log "first tier $HARTLAND_L1 ($(find "$HARTLAND_L1/batches" -name '*.envelope' 2>/dev/null | wc -l) batches restored); promote $promote"
 fi
 
-serve() { # store-dir [--write ns]
-    local dir="$1"; shift
-    "$hartland" proxy serve --dir "$dir" --listen 127.0.0.1:8980 --execute sandbox "${l1_args[@]}" \
-        --registry ghcr.io --read "$namespace" --keyring "$work/keyring.json" \
-        --jwks "$hl/keys/github-actions-jwks.json" --publish-every 3600 "$@" \
+serve() { # store-dir promote [--write ns]
+    local dir="$1" policy="$2"; shift 2
+    local policy_args=()
+    [ -n "${HARTLAND_L1:-}" ] && policy_args=(--promote "$policy")
+    "$hartland" proxy serve --dir "$dir" --listen 127.0.0.1:8980 --execute sandbox \
+        "${registry_args[@]}" "${policy_args[@]}" --publish-every 3600 "$@" \
         >>"$out/proxy.log" 2>&1 &
     proxy=$!
     for _ in $(seq 100); do (exec 3<>/dev/tcp/127.0.0.1/8980) 2>/dev/null && return 0; sleep 0.2; done
@@ -95,7 +97,7 @@ CFG
 }
 
 log "phase 1: build, execute in the sandbox, sign, publish"
-serve "$work/store1" --write "$namespace"
+serve "$work/store1" "$promote" --write "$namespace"
 build first && log "first build succeeded" || { log "first build FAILED"; kill -TERM "$proxy"; wait "$proxy" || true; exit 1; }
 
 # Package attestations: one signed statement per target, binding its output
@@ -124,10 +126,24 @@ done < "$work/outputs.tsv"
 cp "$work/keyring.json" "$out/keyring.json"
 
 kill -TERM "$proxy"; wait "$proxy" || true
-grep -E 'published|publish failed' "$out/proxy.log" | tail -1 | tee -a "$out/summary.txt" >&2 || true
+grep -E 'signed new results|queued|publish failed' "$out/proxy.log" | tee -a "$out/summary.txt" >&2 || true
+
+# Registry promotion runs in the background from here: nothing below needs
+# it, and it is waited for only before the first tier is saved.
+promoter=
+if [ -n "${HARTLAND_L1:-}" ]; then
+    "$hartland" proxy promote --dir "$work/store-promote" "${registry_args[@]}" --write "$namespace" \
+        >"$out/promote.log" 2>&1 &
+    promoter=$!
+fi
 
 log "phase 2: fresh proxy, empty store: everything must come from signed entries"
-serve "$work/store2"
+serve "$work/store2" none
 build second && log "second build succeeded" || log "second build FAILED"
 grep -E 'Cache hits|Commands' "$out/build-second.log" | sed 's/^.*\] //' | tee -a "$out/summary.txt" >&2 || true
 kill -TERM "$proxy"; wait "$proxy" || true
+
+if [ -n "$promoter" ]; then
+    if wait "$promoter"; then log "registry promotion done"; else log "registry promotion FAILED (queued again next run)"; fi
+    grep -E 'promoted|registry updated|ERROR' "$out/promote.log" | tail -3 | tee -a "$out/summary.txt" >&2 || true
+fi

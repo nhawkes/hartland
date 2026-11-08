@@ -4,9 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
 async-trait = "0.1.92"
 base64 = "0.23.1"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dashmap = "6.2.1"
 futures = "0.3.34"
+hex = "0.4.3"
+monostate = "1.0.3"
+nix = { version = "0.31.3", features = ["user", "fs"] }
+oci-spec = { version = "0.10.0", default-features = false, features = ["image"] }
 prost = "0.14.4"
 prost-types = "0.14.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2", "query"] }
@@ -14,6 +22,9 @@ ring = "0.17.14"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+serde_with = { version = "3.24.0", default-features = false, features = ["macros", "base64", "hex", "std"] }
+tempfile = "3.27.0"
+thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "signal", "time", "sync", "process"] }
 tokio-stream = "0.1.19"
 tonic = "0.14.9"
@@ -26,4 +37,5 @@ protox = "0.10.0"
 tonic-prost-build = "0.14.9"
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["test-util"] }

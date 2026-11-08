@@ -17,18 +17,8 @@ pub fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         install_ring();
-        reqwest::Client::builder().user_agent("hartland").build().expect("HTTP client")
-    })
-}
-
-/// A client that reports redirects instead of following them.
-pub fn no_redirect_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        install_ring();
         reqwest::Client::builder()
             .user_agent("hartland")
-            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("HTTP client")
     })

@@ -1,39 +1,49 @@
 //! The two GitHub endpoints we use: minting an OIDC token inside a job, and
 //! fetching the public signing keys.
 
+use crate::attest::Audience;
 use crate::jwt::Jwks;
 
 pub const JWKS_URL: &str = "https://token.actions.githubusercontent.com/.well-known/jwks";
 
-/// Requests an OIDC token with the given audience. Only works inside a GitHub
-/// Actions job with `id-token: write`. The request credentials are read from
-/// the environment; callers must keep them away from build actions.
-pub async fn request_token(audience: &str) -> Result<String, String> {
-    let url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL")
-        .map_err(|_| "ACTIONS_ID_TOKEN_REQUEST_URL not set (not in Actions, or no id-token: write?)")?;
-    let bearer = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").map_err(|_| "ACTIONS_ID_TOKEN_REQUEST_TOKEN not set")?;
-    let resp = crate::http::client()
-        .get(&url)
-        .query(&[("audience", audience)])
-        .bearer_auth(bearer)
-        .send()
-        .await
-        .map_err(|e| format!("token request failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("token request refused: {e}"))?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| format!("token response not JSON: {e}"))?;
-    v.get("value").and_then(|t| t.as_str()).map(str::to_string).ok_or_else(|| "token response has no value".to_string())
+#[derive(Debug, thiserror::Error)]
+pub enum TokenError {
+    #[error("{0} not set (not in GitHub Actions, or no `id-token: write`?)")]
+    NotInActions(&'static str),
+    #[error("token request failed: {0}")]
+    Request(#[from] reqwest::Error),
 }
 
-pub async fn fetch_jwks() -> Result<Jwks, String> {
+#[derive(serde::Deserialize)]
+struct TokenResponse {
+    value: String,
+}
+
+/// Requests an OIDC token for `audience`. Only works inside a GitHub Actions
+/// job with `id-token: write`. The request credentials are read from the
+/// environment; callers must keep them away from build actions.
+pub async fn request_token(audience: &Audience) -> Result<String, TokenError> {
+    let var = |k: &'static str| std::env::var(k).map_err(|_| TokenError::NotInActions(k));
+    let url = var("ACTIONS_ID_TOKEN_REQUEST_URL")?;
+    let bearer = var("ACTIONS_ID_TOKEN_REQUEST_TOKEN")?;
+    let r: TokenResponse = crate::http::client()
+        .get(&url)
+        .query(&[("audience", audience.to_string())])
+        .bearer_auth(bearer)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(r.value)
+}
+
+pub async fn fetch_jwks() -> Result<Jwks, reqwest::Error> {
     crate::http::client()
         .get(JWKS_URL)
         .send()
-        .await
-        .map_err(|e| format!("JWKS fetch failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("JWKS fetch refused: {e}"))?
+        .await?
+        .error_for_status()?
         .json()
         .await
-        .map_err(|e| format!("JWKS not valid: {e}"))
 }

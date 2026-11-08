@@ -3,193 +3,245 @@
 //! network and disk I/O, and nothing may stall the gRPC server (buck2's
 //! keepalives time out if it does).
 //!
-//! Storage is behind `Store`. `DiskStore` keeps blobs and action results on
-//! local disk; the registry store (ghcr_store) adds signed remote entries.
-//! Every CAS write is checked against its claimed digest.
+//! Requests are parsed at the boundary: digests become `Digest`s and uploads
+//! become `Blob`s (checked against their digest) before any store sees them.
 
-use crate::attest::sha256_hex;
+use crate::cas::{Blob, Cas};
+use crate::digest::{ActionDigest, ActionId, Digest, ParseError, Sha256};
 use crate::reapi::bs::byte_stream_server::{ByteStream, ByteStreamServer};
-use crate::reapi::bs::{QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
+use crate::reapi::bs::{
+    QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
+    WriteResponse,
+};
+use crate::reapi::google::longrunning::{Operation, operation};
 use crate::reapi::google::rpc;
 use crate::reapi::re;
 use crate::reapi::re::action_cache_server::{ActionCache, ActionCacheServer};
 use crate::reapi::re::capabilities_server::{Capabilities, CapabilitiesServer};
-use crate::reapi::re::content_addressable_storage_server::{ContentAddressableStorage, ContentAddressableStorageServer};
+use crate::reapi::re::content_addressable_storage_server::{
+    ContentAddressableStorage, ContentAddressableStorageServer,
+};
+use bytes::{Bytes, BytesMut};
+use futures::stream::BoxStream;
 use futures::{StreamExt as _, TryStreamExt as _};
 use prost::Message as _;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
-use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
-pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const MAX_BATCH_BYTES: i64 = 4 << 20;
+const MAX_MESSAGE_BYTES: usize = 64 << 20;
 const READ_CHUNK: usize = 1 << 20;
 /// Concurrent store operations per request (e.g. FindMissingBlobs batches).
 const STORE_CONCURRENCY: usize = 64;
 
-#[async_trait::async_trait]
-pub trait Store: Send + Sync + 'static {
-    async fn has_blob(&self, hash: &str) -> bool;
-    async fn get_blob(&self, hash: &str) -> Option<Vec<u8>>;
-    /// `data` has already been checked against `hash`.
-    async fn put_blob(&self, hash: &str, data: &[u8]) -> Result<(), String>;
-    async fn get_action_result(&self, action: &str) -> Option<re::ActionResult>;
-    /// `action_size` is the size of the serialised Action, for signed statements.
-    async fn put_action_result(&self, action: &str, action_size: i64, result: &re::ActionResult) -> Result<(), String>;
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Registry(#[from] crate::oci::OciError),
+    #[error(transparent)]
+    Signing(#[from] crate::github::TokenError),
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+    #[error(transparent)]
+    Decode(#[from] prost::DecodeError),
+    #[error("blob {0:?} unavailable")]
+    Unavailable(Sha256),
+    #[error("results pending but nowhere to publish them")]
+    Nowhere,
 }
 
+#[async_trait::async_trait]
+pub trait Store: Send + Sync + 'static {
+    async fn has_blob(&self, hash: &Sha256) -> bool;
+    async fn get_blob(&self, hash: &Sha256) -> Option<Blob>;
+    async fn put_blob(&self, blob: &Blob) -> Result<(), StoreError>;
+    async fn get_action_result(&self, action: &ActionId) -> Option<re::ActionResult>;
+    async fn put_action_result(
+        &self,
+        action: ActionDigest,
+        result: &re::ActionResult,
+    ) -> Result<(), StoreError>;
+}
+
+/// Blobs and action results on local disk.
 pub struct DiskStore {
-    root: PathBuf,
+    cas: Cas,
+    ac: PathBuf,
+    tmp: PathBuf,
 }
 
 impl DiskStore {
-    pub async fn new(root: PathBuf) -> Result<DiskStore, String> {
-        for d in ["cas", "ac", "tmp"] {
-            tokio::fs::create_dir_all(root.join(d)).await.map_err(|e| format!("{}: {e}", root.display()))?;
-        }
-        Ok(DiskStore { root })
-    }
-
-    fn cas_path(&self, hash: &str) -> PathBuf {
-        self.root.join("cas").join(&hash[..2]).join(hash)
-    }
-
-    async fn write_atomic(&self, path: &PathBuf, data: &[u8]) -> Result<(), String> {
-        if let Some(p) = path.parent() {
-            tokio::fs::create_dir_all(p).await.map_err(|e| e.to_string())?;
-        }
-        // Unique per write: concurrent uploads of the same blob must not share
-        // a temporary file (the loser's rename would find it gone).
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = self.root.join("tmp").join(format!("{}-{n}", std::process::id()));
-        tokio::fs::write(&tmp, data).await.map_err(|e| e.to_string())?;
-        tokio::fs::rename(&tmp, path).await.map_err(|e| e.to_string())
+    pub async fn open(root: PathBuf) -> std::io::Result<DiskStore> {
+        let (ac, tmp) = (root.join("ac"), root.join("tmp"));
+        tokio::fs::create_dir_all(&ac).await?;
+        Ok(DiskStore {
+            cas: Cas::open(root.join("cas"), tmp.clone()).await?,
+            ac,
+            tmp,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl Store for DiskStore {
-    async fn has_blob(&self, hash: &str) -> bool {
-        hash == EMPTY_SHA256 || tokio::fs::try_exists(self.cas_path(hash)).await.unwrap_or(false)
+    async fn has_blob(&self, hash: &Sha256) -> bool {
+        self.cas.contains(hash).await
     }
-    async fn get_blob(&self, hash: &str) -> Option<Vec<u8>> {
-        if hash == EMPTY_SHA256 {
-            return Some(Vec::new());
-        }
-        tokio::fs::read(self.cas_path(hash)).await.ok()
+    async fn get_blob(&self, hash: &Sha256) -> Option<Blob> {
+        self.cas.get(hash).await
     }
-    async fn put_blob(&self, hash: &str, data: &[u8]) -> Result<(), String> {
-        let p = self.cas_path(hash);
-        if tokio::fs::try_exists(&p).await.unwrap_or(false) { Ok(()) } else { self.write_atomic(&p, data).await }
+    async fn put_blob(&self, blob: &Blob) -> Result<(), StoreError> {
+        Ok(self.cas.put(blob).await?)
     }
-    async fn get_action_result(&self, action: &str) -> Option<re::ActionResult> {
-        let bytes = tokio::fs::read(self.root.join("ac").join(action)).await.ok()?;
+    async fn get_action_result(&self, action: &ActionId) -> Option<re::ActionResult> {
+        let bytes = tokio::fs::read(self.ac.join(action.to_string()))
+            .await
+            .ok()?;
         re::ActionResult::decode(bytes.as_slice()).ok()
     }
-    async fn put_action_result(&self, action: &str, _action_size: i64, result: &re::ActionResult) -> Result<(), String> {
-        self.write_atomic(&self.root.join("ac").join(action), &result.encode_to_vec()).await
+    async fn put_action_result(
+        &self,
+        action: ActionDigest,
+        result: &re::ActionResult,
+    ) -> Result<(), StoreError> {
+        Ok(crate::cas::write_atomic(
+            &self.tmp,
+            &self.ac.join(action.id.to_string()),
+            result.encode_to_vec().into(),
+        )
+        .await?)
     }
 }
 
-fn check_digest(d: &Option<re::Digest>) -> Result<(String, i64), Status> {
-    let d = d.as_ref().ok_or_else(|| Status::invalid_argument("missing digest"))?;
-    crate::attest::check_hex(&d.hash).map_err(Status::invalid_argument)?;
-    if d.size_bytes < 0 {
-        return Err(Status::invalid_argument("negative size"));
-    }
-    Ok((d.hash.clone(), d.size_bytes))
-}
-
-fn verify(hash: &str, size: i64, data: &[u8]) -> Result<(), Status> {
-    if data.len() as i64 != size || sha256_hex(data) != hash {
-        return Err(Status::invalid_argument(format!("data does not match digest {hash}/{size}")));
-    }
-    Ok(())
-}
-
-fn ok_status() -> Option<rpc::Status> {
-    Some(rpc::Status { code: 0, message: String::new(), details: vec![] })
-}
-
-fn err_status(code: tonic::Code, msg: String) -> Option<rpc::Status> {
-    Some(rpc::Status { code: code as i32, message: msg, details: vec![] })
+/// Every blob an action result names directly (outputs, output trees,
+/// stdout and stderr).
+pub fn direct_blobs(r: &re::ActionResult) -> Result<BTreeSet<Sha256>, ParseError> {
+    r.output_files
+        .iter()
+        .filter_map(|f| f.digest.as_ref())
+        .chain(
+            r.output_directories
+                .iter()
+                .filter_map(|d| d.tree_digest.as_ref()),
+        )
+        .chain(r.stdout_digest.iter())
+        .chain(r.stderr_digest.iter())
+        .map(|d| Digest::try_from(d).map(|d| d.hash))
+        .collect()
 }
 
 /// Every blob an action result names directly is present.
 pub async fn outputs_present(store: &dyn Store, r: &re::ActionResult) -> bool {
-    let hashes: Vec<String> = r
-        .output_files
-        .iter()
-        .filter_map(|f| f.digest.as_ref())
-        .chain(r.output_directories.iter().filter_map(|d| d.tree_digest.as_ref()))
-        .chain(r.stdout_digest.iter())
-        .chain(r.stderr_digest.iter())
-        .map(|d| d.hash.clone())
-        .collect();
-    futures::stream::iter(hashes)
+    let Ok(blobs) = direct_blobs(r) else {
+        return false;
+    };
+    futures::stream::iter(blobs)
         .map(|h| async move { store.has_blob(&h).await })
         .buffer_unordered(STORE_CONCURRENCY)
         .all(|present| async move { present })
         .await
 }
 
+impl From<ParseError> for Status {
+    fn from(e: ParseError) -> Status {
+        Status::invalid_argument(e.to_string())
+    }
+}
+
+impl From<StoreError> for Status {
+    fn from(e: StoreError) -> Status {
+        Status::internal(e.to_string())
+    }
+}
+
+fn rpc_status(code: tonic::Code, message: String) -> Option<rpc::Status> {
+    Some(rpc::Status {
+        code: code as i32,
+        message,
+        details: vec![],
+    })
+}
+
+fn ok_status() -> Option<rpc::Status> {
+    Some(rpc::Status::default())
+}
+
 #[derive(Clone)]
 pub struct Proxy {
     store: Arc<dyn Store>,
+    /// With an executor, the proxy runs actions in the sandbox and refuses
+    /// client UpdateActionResult: only results of actions it ran itself may
+    /// be vouched for.
     executor: Option<Arc<crate::execute::Executor>>,
     /// Bounds concurrent executions (buck2 submits hundreds at once).
     exec_slots: Arc<tokio::sync::Semaphore>,
-    /// Accept UpdateActionResult from clients. Off when executing: only
-    /// results of actions this proxy ran itself may be vouched for.
-    accept_uploads: bool,
 }
 
 impl Proxy {
     pub fn new(store: Arc<dyn Store>) -> Proxy {
-        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
-        Proxy { store, executor: None, exec_slots: Arc::new(tokio::sync::Semaphore::new(cpus)), accept_uploads: true }
+        let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
+        Proxy {
+            store,
+            executor: None,
+            exec_slots: Arc::new(tokio::sync::Semaphore::new(cpus)),
+        }
     }
 
-    /// Enables remote execution in the sandbox and refuses client-supplied
-    /// action results.
-    pub fn with_executor(mut self, executor: crate::execute::Executor) -> Proxy {
-        self.executor = Some(Arc::new(executor));
-        self.accept_uploads = false;
-        self
+    pub fn with_executor(self, executor: crate::execute::Executor) -> Proxy {
+        Proxy {
+            executor: Some(Arc::new(executor)),
+            ..self
+        }
     }
 
-    pub async fn serve(self, addr: std::net::SocketAddr) -> Result<(), String> {
+    pub async fn serve(self, addr: std::net::SocketAddr) -> Result<(), tonic::transport::Error> {
         tonic::transport::Server::builder()
             .add_service(CapabilitiesServer::new(self.clone()))
-            .add_service(ContentAddressableStorageServer::new(self.clone()).max_decoding_message_size(64 << 20))
+            .add_service(
+                ContentAddressableStorageServer::new(self.clone())
+                    .max_decoding_message_size(MAX_MESSAGE_BYTES),
+            )
             .add_service(ActionCacheServer::new(self.clone()))
             .add_service(re::execution_server::ExecutionServer::new(self.clone()))
-            .add_service(ByteStreamServer::new(self).max_decoding_message_size(64 << 20))
+            .add_service(ByteStreamServer::new(self).max_decoding_message_size(MAX_MESSAGE_BYTES))
             .serve(addr)
             .await
-            .map_err(|e| e.to_string())
     }
 
-    async fn served_result(&self, hash: &str) -> Option<re::ActionResult> {
-        let r = self.store.get_action_result(hash).await?;
-        if outputs_present(&*self.store, &r).await { Some(r) } else { None }
+    /// A result whose outputs are all present.
+    async fn served_result(&self, action: &ActionId) -> Option<re::ActionResult> {
+        let r = self.store.get_action_result(action).await?;
+        outputs_present(&*self.store, &r).await.then_some(r)
     }
 }
 
 #[tonic::async_trait]
 impl Capabilities for Proxy {
-    async fn get_capabilities(&self, _: Request<re::GetCapabilitiesRequest>) -> Result<Response<re::ServerCapabilities>, Status> {
+    async fn get_capabilities(
+        &self,
+        _: Request<re::GetCapabilitiesRequest>,
+    ) -> Result<Response<re::ServerCapabilities>, Status> {
         use re::digest_function::Value as DigestFn;
-        let semver = |major, minor| crate::reapi::build::bazel::semver::SemVer { major, minor, patch: 0, prerelease: String::new() };
+        let semver = |major, minor| crate::reapi::build::bazel::semver::SemVer {
+            major,
+            minor,
+            patch: 0,
+            prerelease: String::new(),
+        };
         Ok(Response::new(re::ServerCapabilities {
             cache_capabilities: Some(re::CacheCapabilities {
                 digest_functions: vec![DigestFn::Sha256 as i32],
-                action_cache_update_capabilities: Some(re::ActionCacheUpdateCapabilities { update_enabled: true }),
+                action_cache_update_capabilities: Some(re::ActionCacheUpdateCapabilities {
+                    update_enabled: true,
+                }),
                 max_batch_total_size_bytes: MAX_BATCH_BYTES,
-                symlink_absolute_path_strategy: re::symlink_absolute_path_strategy::Value::Disallowed as i32,
+                symlink_absolute_path_strategy:
+                    re::symlink_absolute_path_strategy::Value::Disallowed as i32,
                 ..Default::default()
             }),
             execution_capabilities: self.executor.as_ref().map(|_| re::ExecutionCapabilities {
@@ -207,56 +259,82 @@ impl Capabilities for Proxy {
 
 #[tonic::async_trait]
 impl ContentAddressableStorage for Proxy {
-    async fn find_missing_blobs(&self, req: Request<re::FindMissingBlobsRequest>) -> Result<Response<re::FindMissingBlobsResponse>, Status> {
-        let digests = req.into_inner().blob_digests;
-        for d in &digests {
-            check_digest(&Some(d.clone()))?;
-        }
+    async fn find_missing_blobs(
+        &self,
+        req: Request<re::FindMissingBlobsRequest>,
+    ) -> Result<Response<re::FindMissingBlobsResponse>, Status> {
+        let digests: Vec<Digest> = req
+            .into_inner()
+            .blob_digests
+            .iter()
+            .map(Digest::try_from)
+            .collect::<Result<_, _>>()?;
         let store = &*self.store;
-        let missing: Vec<re::Digest> = futures::stream::iter(digests)
-            .map(|d| async move { if store.has_blob(&d.hash).await { None } else { Some(d) } })
+        let missing = futures::stream::iter(digests)
+            .map(|d| async move { (!store.has_blob(&d.hash).await).then_some(d.into()) })
             .buffer_unordered(STORE_CONCURRENCY)
-            .filter_map(|d| async move { d })
+            .filter_map(futures::future::ready)
             .collect()
             .await;
-        Ok(Response::new(re::FindMissingBlobsResponse { missing_blob_digests: missing }))
+        Ok(Response::new(re::FindMissingBlobsResponse {
+            missing_blob_digests: missing,
+        }))
     }
 
-    async fn batch_update_blobs(&self, req: Request<re::BatchUpdateBlobsRequest>) -> Result<Response<re::BatchUpdateBlobsResponse>, Status> {
-        let requests = req.into_inner().requests;
+    async fn batch_update_blobs(
+        &self,
+        req: Request<re::BatchUpdateBlobsRequest>,
+    ) -> Result<Response<re::BatchUpdateBlobsResponse>, Status> {
         let store = &*self.store;
-        let mut responses = Vec::with_capacity(requests.len());
-        let mut s = futures::stream::iter(requests)
+        let responses = futures::stream::iter(req.into_inner().requests)
             .map(|r| async move {
-                let status = match check_digest(&r.digest).and_then(|(h, n)| verify(&h, n, &r.data).map(|_| h)) {
-                    Err(e) => err_status(tonic::Code::InvalidArgument, e.message().to_string()),
-                    Ok(hash) => match store.put_blob(&hash, &r.data).await {
+                let checked = Digest::try_from(r.digest.as_ref())
+                    .map_err(|e| e.to_string())
+                    .and_then(|d| Blob::check(d, r.data).map_err(|e| e.to_string()));
+                let status = match checked {
+                    Err(e) => rpc_status(tonic::Code::InvalidArgument, e),
+                    Ok(blob) => match store.put_blob(&blob).await {
                         Ok(()) => ok_status(),
-                        Err(e) => err_status(tonic::Code::Internal, e),
+                        Err(e) => rpc_status(tonic::Code::Internal, e.to_string()),
                     },
                 };
-                re::batch_update_blobs_response::Response { digest: r.digest, status }
+                re::batch_update_blobs_response::Response {
+                    digest: r.digest,
+                    status,
+                }
             })
-            .buffer_unordered(STORE_CONCURRENCY);
-        while let Some(r) = s.next().await {
-            responses.push(r);
-        }
+            .buffer_unordered(STORE_CONCURRENCY)
+            .collect()
+            .await;
         Ok(Response::new(re::BatchUpdateBlobsResponse { responses }))
     }
 
-    async fn batch_read_blobs(&self, req: Request<re::BatchReadBlobsRequest>) -> Result<Response<re::BatchReadBlobsResponse>, Status> {
-        let digests = req.into_inner().digests;
-        for d in &digests {
-            check_digest(&Some(d.clone()))?;
-        }
+    async fn batch_read_blobs(
+        &self,
+        req: Request<re::BatchReadBlobsRequest>,
+    ) -> Result<Response<re::BatchReadBlobsResponse>, Status> {
+        let digests: Vec<Digest> = req
+            .into_inner()
+            .digests
+            .iter()
+            .map(Digest::try_from)
+            .collect::<Result<_, _>>()?;
         let store = &*self.store;
         let responses = futures::stream::iter(digests)
             .map(|d| async move {
                 let (data, status) = match store.get_blob(&d.hash).await {
-                    Some(b) => (b, ok_status()),
-                    None => (Vec::new(), err_status(tonic::Code::NotFound, format!("blob {} not found", d.hash))),
+                    Some(b) => (b.into_data(), ok_status()),
+                    None => (
+                        Bytes::new(),
+                        rpc_status(tonic::Code::NotFound, format!("blob {} not found", d.hash)),
+                    ),
                 };
-                re::batch_read_blobs_response::Response { digest: Some(d), data, compressor: 0, status }
+                re::batch_read_blobs_response::Response {
+                    digest: Some(d.into()),
+                    data,
+                    compressor: 0,
+                    status,
+                }
             })
             .buffer_unordered(STORE_CONCURRENCY)
             .collect()
@@ -264,89 +342,138 @@ impl ContentAddressableStorage for Proxy {
         Ok(Response::new(re::BatchReadBlobsResponse { responses }))
     }
 
-    type GetTreeStream = Pin<Box<dyn Stream<Item = Result<re::GetTreeResponse, Status>> + Send>>;
+    type GetTreeStream = BoxStream<'static, Result<re::GetTreeResponse, Status>>;
 
-    async fn get_tree(&self, _: Request<re::GetTreeRequest>) -> Result<Response<Self::GetTreeStream>, Status> {
+    async fn get_tree(
+        &self,
+        _: Request<re::GetTreeRequest>,
+    ) -> Result<Response<Self::GetTreeStream>, Status> {
         Err(Status::unimplemented("GetTree is not supported"))
     }
 
-    async fn split_blob(&self, _: Request<re::SplitBlobRequest>) -> Result<Response<re::SplitBlobResponse>, Status> {
+    async fn split_blob(
+        &self,
+        _: Request<re::SplitBlobRequest>,
+    ) -> Result<Response<re::SplitBlobResponse>, Status> {
         Err(Status::unimplemented("SplitBlob is not supported"))
     }
 
-    async fn splice_blob(&self, _: Request<re::SpliceBlobRequest>) -> Result<Response<re::SpliceBlobResponse>, Status> {
+    async fn splice_blob(
+        &self,
+        _: Request<re::SpliceBlobRequest>,
+    ) -> Result<Response<re::SpliceBlobResponse>, Status> {
         Err(Status::unimplemented("SpliceBlob is not supported"))
     }
 }
 
 #[tonic::async_trait]
 impl ActionCache for Proxy {
-    async fn get_action_result(&self, req: Request<re::GetActionResultRequest>) -> Result<Response<re::ActionResult>, Status> {
-        let (hash, _) = check_digest(&req.into_inner().action_digest)?;
-        // Only serve a result whose outputs are all present.
-        match self.served_result(&hash).await {
+    async fn get_action_result(
+        &self,
+        req: Request<re::GetActionResultRequest>,
+    ) -> Result<Response<re::ActionResult>, Status> {
+        let action = ActionDigest::from(Digest::try_from(req.into_inner().action_digest.as_ref())?);
+        match self.served_result(&action.id).await {
             Some(r) => Ok(Response::new(r)),
-            None => Err(Status::not_found(format!("no result for action {hash}"))),
+            None => Err(Status::not_found(format!(
+                "no result for action {}",
+                action.id
+            ))),
         }
     }
 
-    async fn update_action_result(&self, req: Request<re::UpdateActionResultRequest>) -> Result<Response<re::ActionResult>, Status> {
-        if !self.accept_uploads {
-            return Err(Status::permission_denied("this proxy only stores results of actions it executed"));
+    async fn update_action_result(
+        &self,
+        req: Request<re::UpdateActionResultRequest>,
+    ) -> Result<Response<re::ActionResult>, Status> {
+        if self.executor.is_some() {
+            return Err(Status::permission_denied(
+                "this proxy only stores results of actions it executed",
+            ));
         }
         let req = req.into_inner();
-        let (hash, size) = check_digest(&req.action_digest)?;
-        let result = req.action_result.ok_or_else(|| Status::invalid_argument("missing action_result"))?;
+        let action = ActionDigest::from(Digest::try_from(req.action_digest.as_ref())?);
+        let result = req
+            .action_result
+            .ok_or_else(|| Status::invalid_argument("missing action_result"))?;
         if !outputs_present(&*self.store, &result).await {
-            return Err(Status::failed_precondition("action result references blobs not in the CAS"));
+            return Err(Status::failed_precondition(
+                "action result references blobs not in the CAS",
+            ));
         }
-        self.store.put_action_result(&hash, size, &result).await.map_err(Status::internal)?;
+        self.store.put_action_result(action, &result).await?;
         Ok(Response::new(result))
     }
 }
 
 /// `{instance}/blobs/{hash}/{size}` or `{instance}/uploads/{uuid}/blobs/{hash}/{size}`.
-fn parse_resource(name: &str) -> Result<(String, i64), Status> {
-    let parts: Vec<&str> = name.split('/').collect();
-    let i = parts.iter().rposition(|p| *p == "blobs").ok_or_else(|| Status::invalid_argument(format!("bad resource name {name}")))?;
-    let (hash, size) = match (parts.get(i + 1), parts.get(i + 2)) {
-        (Some(h), Some(s)) => (h.to_string(), s.parse::<i64>().map_err(|_| Status::invalid_argument("bad size"))?),
-        _ => return Err(Status::invalid_argument(format!("bad resource name {name}"))),
-    };
-    crate::attest::check_hex(&hash).map_err(Status::invalid_argument)?;
-    Ok((hash, size))
+struct ResourceName(Digest);
+
+impl FromStr for ResourceName {
+    type Err = Status;
+    fn from_str(name: &str) -> Result<ResourceName, Status> {
+        let bad = || Status::invalid_argument(format!("bad resource name {name}"));
+        let mut rest = name.rsplit('/');
+        let (Some(size), Some(hash), Some("blobs")) = (rest.next(), rest.next(), rest.next())
+        else {
+            return Err(bad());
+        };
+        Ok(ResourceName(Digest {
+            hash: hash.parse()?,
+            size: size.parse().map_err(|_| bad())?,
+        }))
+    }
 }
 
 #[tonic::async_trait]
 impl ByteStream for Proxy {
-    type ReadStream = Pin<Box<dyn Stream<Item = Result<ReadResponse, Status>> + Send>>;
+    type ReadStream = BoxStream<'static, Result<ReadResponse, Status>>;
 
     async fn read(&self, req: Request<ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
         let req = req.into_inner();
-        let (hash, _) = parse_resource(&req.resource_name)?;
-        let data = self.store.get_blob(&hash).await.ok_or_else(|| Status::not_found(format!("blob {hash} not found")))?;
-        let start = usize::try_from(req.read_offset).map_err(|_| Status::out_of_range("bad offset"))?;
-        if start > data.len() {
-            return Err(Status::out_of_range("offset past end"));
-        }
-        let end = if req.read_limit > 0 { (start + req.read_limit as usize).min(data.len()) } else { data.len() };
-        let chunks: Vec<Result<ReadResponse, Status>> = if start == end {
-            vec![Ok(ReadResponse { data: Vec::new() })]
-        } else {
-            data[start..end].chunks(READ_CHUNK).map(|c| Ok(ReadResponse { data: c.to_vec() })).collect()
+        let ResourceName(digest) = req.resource_name.parse()?;
+        let data = self
+            .store
+            .get_blob(&digest.hash)
+            .await
+            .ok_or_else(|| Status::not_found(format!("blob {} not found", digest.hash)))?
+            .into_data();
+        let start = usize::try_from(req.read_offset)
+            .ok()
+            .filter(|s| *s <= data.len())
+            .ok_or_else(|| Status::out_of_range("bad offset"))?;
+        let end = match usize::try_from(req.read_limit) {
+            Ok(limit) if limit > 0 => (start + limit).min(data.len()),
+            _ => data.len(),
         };
-        Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+        let window = data.slice(start..end);
+        let chunks: Vec<Result<ReadResponse, Status>> = if window.is_empty() {
+            vec![Ok(ReadResponse { data: Bytes::new() })]
+        } else {
+            (0..window.len())
+                .step_by(READ_CHUNK)
+                .map(|i| {
+                    Ok(ReadResponse {
+                        data: window.slice(i..(i + READ_CHUNK).min(window.len())),
+                    })
+                })
+                .collect()
+        };
+        Ok(Response::new(futures::stream::iter(chunks).boxed()))
     }
 
-    async fn write(&self, req: Request<Streaming<WriteRequest>>) -> Result<Response<WriteResponse>, Status> {
+    async fn write(
+        &self,
+        req: Request<Streaming<WriteRequest>>,
+    ) -> Result<Response<WriteResponse>, Status> {
         let mut stream = req.into_inner();
-        let mut target: Option<(String, i64)> = None;
-        let mut data = Vec::new();
+        let mut target: Option<Digest> = None;
+        let mut data = BytesMut::new();
         while let Some(msg) = stream.try_next().await? {
             if target.is_none() {
-                target = Some(parse_resource(&msg.resource_name)?);
+                target = Some(msg.resource_name.parse::<ResourceName>()?.0);
             }
-            if msg.write_offset as usize != data.len() {
+            if usize::try_from(msg.write_offset).ok() != Some(data.len()) {
                 return Err(Status::invalid_argument("non-sequential write"));
             }
             data.extend_from_slice(&msg.data);
@@ -354,62 +481,100 @@ impl ByteStream for Proxy {
                 break;
             }
         }
-        let (hash, size) = target.ok_or_else(|| Status::invalid_argument("empty write"))?;
-        verify(&hash, size, &data)?;
-        self.store.put_blob(&hash, &data).await.map_err(Status::internal)?;
-        Ok(Response::new(WriteResponse { committed_size: data.len() as i64 }))
+        let digest = target.ok_or_else(|| Status::invalid_argument("empty write"))?;
+        let blob = Blob::check(digest, data.freeze())
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.store.put_blob(&blob).await?;
+        Ok(Response::new(WriteResponse {
+            committed_size: digest.size as i64,
+        }))
     }
 
-    async fn query_write_status(&self, req: Request<QueryWriteStatusRequest>) -> Result<Response<QueryWriteStatusResponse>, Status> {
-        let (hash, size) = parse_resource(&req.into_inner().resource_name)?;
-        let complete = self.store.has_blob(&hash).await;
-        Ok(Response::new(QueryWriteStatusResponse { committed_size: if complete { size } else { 0 }, complete }))
+    async fn query_write_status(
+        &self,
+        req: Request<QueryWriteStatusRequest>,
+    ) -> Result<Response<QueryWriteStatusResponse>, Status> {
+        let ResourceName(digest) = req.into_inner().resource_name.parse()?;
+        let complete = self.store.has_blob(&digest.hash).await;
+        Ok(Response::new(QueryWriteStatusResponse {
+            committed_size: if complete { digest.size as i64 } else { 0 },
+            complete,
+        }))
     }
 }
 
-fn any<M: prost::Message>(type_name: &str, m: &M) -> prost_types::Any {
-    prost_types::Any { type_url: format!("type.googleapis.com/{type_name}"), value: m.encode_to_vec() }
+fn any<M: prost::Name>(m: &M) -> prost_types::Any {
+    prost_types::Any {
+        type_url: M::type_url(),
+        value: m.encode_to_vec(),
+    }
 }
 
 #[tonic::async_trait]
 impl re::execution_server::Execution for Proxy {
-    type ExecuteStream = Pin<Box<dyn Stream<Item = Result<crate::reapi::google::longrunning::Operation, Status>> + Send>>;
+    type ExecuteStream = BoxStream<'static, Result<Operation, Status>>;
     type WaitExecutionStream = Self::ExecuteStream;
 
-    async fn execute(&self, req: Request<re::ExecuteRequest>) -> Result<Response<Self::ExecuteStream>, Status> {
-        use crate::reapi::google::longrunning::{Operation, operation};
-        let executor = self.executor.clone().ok_or_else(|| Status::unimplemented("remote execution is not enabled"))?;
+    async fn execute(
+        &self,
+        req: Request<re::ExecuteRequest>,
+    ) -> Result<Response<Self::ExecuteStream>, Status> {
+        let executor = self
+            .executor
+            .clone()
+            .ok_or_else(|| Status::unimplemented("remote execution is not enabled"))?;
         let req = req.into_inner();
-        let (hash, size) = check_digest(&req.action_digest)?;
-        let digest = re::Digest { hash: hash.clone(), size_bytes: size };
+        let action = ActionDigest::from(Digest::try_from(req.action_digest.as_ref())?);
 
-        let cached = if req.skip_cache_lookup { None } else { self.served_result(&hash).await };
-        let (result, cached_result, status) = match cached {
-            Some(r) => (Some(r), true, ok_status()),
-            None => {
-                let _slot = self.exec_slots.clone().acquire_owned().await.map_err(|e| Status::internal(e.to_string()))?;
-                match executor.execute(&digest).await {
-                    Ok(r) => (Some(r), false, ok_status()),
-                    Err(e) => (None, false, err_status(tonic::Code::Internal, e)),
-                }
+        let cached = if req.skip_cache_lookup {
+            None
+        } else {
+            self.served_result(&action.id).await
+        };
+        let response = if let Some(r) = cached {
+            re::ExecuteResponse {
+                result: Some(r),
+                cached_result: true,
+                status: ok_status(),
+                ..Default::default()
+            }
+        } else {
+            let _slot = self
+                .exec_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            match executor.execute(action).await {
+                Ok(r) => re::ExecuteResponse {
+                    result: Some(r),
+                    status: ok_status(),
+                    ..Default::default()
+                },
+                Err(e) => re::ExecuteResponse {
+                    status: rpc_status(tonic::Code::Internal, e.to_string()),
+                    ..Default::default()
+                },
             }
         };
-        let response = re::ExecuteResponse { result, cached_result, status, ..Default::default() };
         let metadata = re::ExecuteOperationMetadata {
             stage: re::execution_stage::Value::Completed as i32,
-            action_digest: Some(digest),
+            action_digest: Some(Digest::from(action).into()),
             ..Default::default()
         };
         let op = Operation {
-            name: format!("executions/{hash}"),
-            metadata: Some(any("build.bazel.remote.execution.v2.ExecuteOperationMetadata", &metadata)),
+            name: format!("executions/{}", action.id),
+            metadata: Some(any(&metadata)),
             done: true,
-            result: Some(operation::Result::Response(any("build.bazel.remote.execution.v2.ExecuteResponse", &response))),
+            result: Some(operation::Result::Response(any(&response))),
         };
-        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(op)]))))
+        Ok(Response::new(futures::stream::iter([Ok(op)]).boxed()))
     }
 
-    async fn wait_execution(&self, _: Request<re::WaitExecutionRequest>) -> Result<Response<Self::WaitExecutionStream>, Status> {
+    async fn wait_execution(
+        &self,
+        _: Request<re::WaitExecutionRequest>,
+    ) -> Result<Response<Self::WaitExecutionStream>, Status> {
         Err(Status::unimplemented("executions complete within Execute"))
     }
 }

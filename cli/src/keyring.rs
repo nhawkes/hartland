@@ -3,73 +3,234 @@
 //! A builder is a reusable workflow, pinned to commits, running on a
 //! GitHub-hosted runner. Who called it does not matter.
 
+use crate::attest::Audience;
+use crate::digest::GitSha;
+use monostate::MustBe;
 use serde::{Deserialize, Serialize};
+use serde_with::{DeserializeFromStr, OneOrMany, SerializeDisplay, serde_as};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::str::FromStr;
 
-pub const ISSUER: &str = "https://token.actions.githubusercontent.com";
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Builder {
-    /// `owner/repo/.github/workflows/file.yml`
-    pub workflow: String,
-    /// Trusted commits of that workflow (full sha).
-    pub commits: Vec<String>,
+#[derive(Debug, thiserror::Error)]
+pub enum TrustError {
+    #[error("token audience does not match the statement")]
+    Audience,
+    #[error("not built on a GitHub-hosted runner")]
+    SelfHosted,
+    #[error("builder {0}@{1} is not in the keyring")]
+    Untrusted(Workflow, GitSha),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Keyring {
-    pub builders: Vec<Builder>,
+#[derive(Debug, thiserror::Error)]
+#[error("malformed {what}: {input:?}")]
+pub struct Malformed {
+    what: &'static str,
+    input: String,
 }
 
-/// The facts a verified token establishes about who signed.
+/// `owner/repo/.github/workflows/file.yml`
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, SerializeDisplay, DeserializeFromStr,
+)]
+pub struct Workflow {
+    repository: Repository,
+    file: String,
+}
+
+impl FromStr for Workflow {
+    type Err = Malformed;
+    fn from_str(s: &str) -> Result<Workflow, Malformed> {
+        let bad = || Malformed {
+            what: "workflow path",
+            input: s.to_string(),
+        };
+        let mut parts = s.splitn(3, '/');
+        let (Some(owner), Some(repo), Some(file)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(bad());
+        };
+        if !file.starts_with(".github/workflows/") {
+            return Err(bad());
+        }
+        Ok(Workflow {
+            repository: format!("{owner}/{repo}").parse().map_err(|_| bad())?,
+            file: file.to_string(),
+        })
+    }
+}
+
+impl fmt::Display for Workflow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.repository, self.file)
+    }
+}
+
+/// `owner/name`
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, SerializeDisplay, DeserializeFromStr,
+)]
+pub struct Repository {
+    owner: String,
+    name: String,
+}
+
+impl FromStr for Repository {
+    type Err = Malformed;
+    fn from_str(s: &str) -> Result<Repository, Malformed> {
+        let ok = |p: &str| {
+            !p.is_empty()
+                && p.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+        };
+        match s.split_once('/') {
+            Some((owner, name)) if ok(owner) && ok(name) => Ok(Repository {
+                owner: owner.to_string(),
+                name: name.to_string(),
+            }),
+            _ => Err(Malformed {
+                what: "repository",
+                input: s.to_string(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for Repository {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.owner, self.name)
+    }
+}
+
+/// `job_workflow_ref`: `<workflow>@<git ref>` (a branch, tag or commit).
+#[derive(Clone, Debug, DeserializeFromStr)]
+pub struct WorkflowRef {
+    pub workflow: Workflow,
+    pub git_ref: String,
+}
+
+impl FromStr for WorkflowRef {
+    type Err = Malformed;
+    fn from_str(s: &str) -> Result<WorkflowRef, Malformed> {
+        let (w, r) = s.split_once('@').ok_or_else(|| Malformed {
+            what: "job_workflow_ref",
+            input: s.to_string(),
+        })?;
+        Ok(WorkflowRef {
+            workflow: w.parse()?,
+            git_ref: r.to_string(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunnerEnvironment {
+    GithubHosted,
+    SelfHosted,
+}
+
+/// The GitHub Actions OIDC claims we rely on.
+#[serde_as]
+#[derive(Clone, Debug, Deserialize)]
+pub struct Claims {
+    #[allow(dead_code)]
+    iss: MustBe!("https://token.actions.githubusercontent.com"),
+    #[serde_as(as = "OneOrMany<_>")]
+    aud: Vec<String>,
+    runner_environment: RunnerEnvironment,
+    job_workflow_ref: WorkflowRef,
+    job_workflow_sha: GitSha,
+    /// The calling repository and the commit it built: GitHub's word for
+    /// what source was built.
+    repository: Repository,
+    sha: Option<GitSha>,
+    run_id: String,
+}
+
+/// The facts a verified, trusted token establishes about who signed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Signer {
-    pub workflow: String,
-    pub commit: String,
-    /// The calling repository and the commit it built (token `repository`
-    /// and `sha` claims): GitHub's word for what source was built.
-    pub repository: String,
-    pub source_commit: Option<String>,
+    pub workflow: Workflow,
+    pub commit: GitSha,
+    pub repository: Repository,
+    pub source_commit: Option<GitSha>,
     pub run_id: String,
 }
 
-fn claim<'a>(c: &'a serde_json::Value, k: &str) -> Result<&'a str, String> {
-    c.get(k).and_then(|v| v.as_str()).ok_or_else(|| format!("token has no {k} claim"))
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RawKeyring", into = "RawKeyring")]
+pub struct Keyring {
+    builders: BTreeMap<Workflow, BTreeSet<GitSha>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawKeyring {
+    builders: Vec<RawBuilder>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawBuilder {
+    workflow: Workflow,
+    commits: BTreeSet<GitSha>,
+}
+
+impl From<RawKeyring> for Keyring {
+    fn from(r: RawKeyring) -> Keyring {
+        let mut builders: BTreeMap<Workflow, BTreeSet<GitSha>> = BTreeMap::new();
+        for b in r.builders {
+            builders.entry(b.workflow).or_default().extend(b.commits);
+        }
+        Keyring { builders }
+    }
+}
+
+impl From<Keyring> for RawKeyring {
+    fn from(k: Keyring) -> RawKeyring {
+        RawKeyring {
+            builders: k
+                .builders
+                .into_iter()
+                .map(|(workflow, commits)| RawBuilder { workflow, commits })
+                .collect(),
+        }
+    }
 }
 
 impl Keyring {
-    /// Checks verified claims: issuer, audience, hosted runner, trusted builder.
-    pub fn accept(&self, claims: &serde_json::Value, audience: &str) -> Result<Signer, String> {
-        if claim(claims, "iss")? != ISSUER {
-            return Err("token not issued by GitHub Actions".to_string());
+    pub fn trusting(workflow: Workflow, commits: impl IntoIterator<Item = GitSha>) -> Keyring {
+        Keyring {
+            builders: [(workflow, commits.into_iter().collect())].into(),
         }
-        let aud_ok = match claims.get("aud") {
-            Some(serde_json::Value::String(a)) => a == audience,
-            Some(serde_json::Value::Array(a)) => a.len() == 1 && a[0].as_str() == Some(audience),
-            _ => false,
-        };
-        if !aud_ok {
-            return Err("token audience does not match the statement".to_string());
+    }
+
+    /// Accepts verified claims from a trusted builder on a hosted runner,
+    /// bound to `audience`.
+    pub fn accept(&self, claims: &Claims, audience: &Audience) -> Result<Signer, TrustError> {
+        if claims.aud != [audience.to_string()] {
+            return Err(TrustError::Audience);
         }
         // Self-hosted runners can run the same workflow and get valid tokens.
-        if claim(claims, "runner_environment")? != "github-hosted" {
-            return Err("not built on a GitHub-hosted runner".to_string());
+        if claims.runner_environment != RunnerEnvironment::GithubHosted {
+            return Err(TrustError::SelfHosted);
         }
-        let job_ref = claim(claims, "job_workflow_ref")?;
-        let job_sha = claim(claims, "job_workflow_sha")?;
-        let workflow = job_ref.split_once('@').map(|(w, _)| w).ok_or("malformed job_workflow_ref")?;
-        let trusted = self
+        let workflow = &claims.job_workflow_ref.workflow;
+        if !self
             .builders
-            .iter()
-            .any(|b| b.workflow == workflow && b.commits.iter().any(|c| c == job_sha));
-        if !trusted {
-            return Err(format!("builder {workflow}@{job_sha} is not in the keyring"));
+            .get(workflow)
+            .is_some_and(|c| c.contains(&claims.job_workflow_sha))
+        {
+            return Err(TrustError::Untrusted(
+                workflow.clone(),
+                claims.job_workflow_sha,
+            ));
         }
         Ok(Signer {
-            workflow: workflow.to_string(),
-            commit: job_sha.to_string(),
-            repository: claim(claims, "repository")?.to_string(),
-            source_commit: claims.get("sha").and_then(|v| v.as_str()).map(str::to_string),
-            run_id: claim(claims, "run_id")?.to_string(),
+            workflow: workflow.clone(),
+            commit: claims.job_workflow_sha,
+            repository: claims.repository.clone(),
+            source_commit: claims.sha,
+            run_id: claims.run_id.clone(),
         })
     }
 }

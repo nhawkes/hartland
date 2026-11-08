@@ -7,215 +7,179 @@
 //! blob against its digest on read, and nothing here is ever treated as a
 //! result without its signed statement.
 //!
-//! Layout:  batches/<envelope hash>.envelope   the signed envelope
-//!          batches/<envelope hash>.bundle     results + referenced blobs
-//!          blobs/<hh>/<hash>                  content-addressed blobs
-//!          outbox/<name>.json                 registry writes still to do
+//! Layout:  batches/<batch id>.envelope   the signed envelope
+//!          batches/<batch id>.bundle     results + referenced blobs
+//!          blobs/<shard>/<sha256>        content-addressed blobs
+//!          outbox/<sha256>.json          registry writes still to do
 
-use crate::attest::{Envelope, sha256_hex};
+use crate::bundle::VerifiedBatch;
+use crate::cas::{Blob, Cas, write_atomic};
+use crate::digest::{BatchId, Sha256};
 use crate::jwt::Jwks;
 use crate::keyring::Keyring;
-use crate::reapi::re;
-use base64::Engine as _;
-use prost::Message as _;
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct Bundle {
-    pub entries: Vec<BundleEntry>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct BundleEntry {
-    pub action: String,
-    /// base64 of the exact ActionResult bytes the statement signs.
-    pub result: String,
-    pub blobs: Vec<String>,
-}
-
-/// A verified batch: results whose bytes match the signed statement.
-pub struct VerifiedBatch {
-    pub envelope_hash: String,
-    pub envelope: Vec<u8>,
-    pub results: Vec<(String, re::ActionResult, Vec<String>)>,
-}
-
-/// Checks a bundle against its verified envelope; keeps matching entries.
-pub fn accept(envelope_hash: &str, envelope: &[u8], bundle: &[u8], jwks: &Jwks, keyring: &Keyring) -> Option<VerifiedBatch> {
-    let env: Envelope = serde_json::from_slice(envelope).ok()?;
-    let (statement, _signer) = crate::verify_envelope(&env, jwks, keyring).ok()?;
-    let signed: HashMap<String, String> = statement.predicate.results.into_iter().map(|p| (p.action.hash, p.result.hash)).collect();
-    let bundle: Bundle = serde_json::from_slice(bundle).ok()?;
-    let mut results = Vec::new();
-    for e in bundle.entries {
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&e.result) else { continue };
-        if signed.get(&e.action).map(String::as_str) != Some(sha256_hex(&bytes).as_str()) {
-            continue;
-        }
-        let Ok(r) = re::ActionResult::decode(bytes.as_slice()) else { continue };
-        results.push((e.action, r, e.blobs));
-    }
-    Some(VerifiedBatch { envelope_hash: envelope_hash.to_string(), envelope: envelope.to_vec(), results })
-}
-
-pub fn bundle_bytes(entries: &[(String, re::ActionResult, Vec<String>)]) -> Result<Vec<u8>, String> {
-    let b = Bundle {
-        entries: entries
-            .iter()
-            .map(|(a, r, blobs)| BundleEntry {
-                action: a.clone(),
-                result: base64::engine::general_purpose::STANDARD.encode(r.encode_to_vec()),
-                blobs: blobs.clone(),
-            })
-            .collect(),
-    };
-    serde_json::to_vec(&b).map_err(|e| e.to_string())
-}
+use bytes::Bytes;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 pub struct L1 {
-    dir: PathBuf,
+    blobs: Cas,
+    batches: PathBuf,
+    outbox: PathBuf,
+    tmp: PathBuf,
+}
+
+/// A queued plan and the file it came from (removed once done).
+pub struct Queued<T> {
+    pub plan: T,
+    path: PathBuf,
 }
 
 impl L1 {
-    pub async fn open(dir: PathBuf) -> Result<L1, String> {
-        for d in ["batches", "blobs", "tmp", "outbox"] {
-            tokio::fs::create_dir_all(dir.join(d)).await.map_err(|e| format!("{}: {e}", dir.display()))?;
+    pub async fn open(dir: PathBuf) -> std::io::Result<L1> {
+        let (batches, outbox, tmp) = (dir.join("batches"), dir.join("outbox"), dir.join("tmp"));
+        for d in [&batches, &outbox] {
+            tokio::fs::create_dir_all(d).await?;
         }
-        Ok(L1 { dir })
+        Ok(L1 {
+            blobs: Cas::open(dir.join("blobs"), tmp.clone()).await?,
+            batches,
+            outbox,
+            tmp,
+        })
     }
 
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        self.dir.join("blobs").join(&hash[..2.min(hash.len())]).join(hash)
+    pub fn blobs(&self) -> &Cas {
+        &self.blobs
     }
 
-    async fn write_atomic(&self, path: &Path, data: &[u8]) -> Result<(), String> {
-        if tokio::fs::try_exists(path).await.unwrap_or(false) {
-            return Ok(());
-        }
-        if let Some(p) = path.parent() {
-            tokio::fs::create_dir_all(p).await.map_err(|e| e.to_string())?;
-        }
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = self.dir.join("tmp").join(format!("{}-{n}", std::process::id()));
-        tokio::fs::write(&tmp, data).await.map_err(|e| e.to_string())?;
-        tokio::fs::rename(&tmp, path).await.map_err(|e| e.to_string())
+    fn batch_file(&self, id: &BatchId, ext: &str) -> PathBuf {
+        self.batches.join(format!("{id}.{ext}"))
     }
 
-    pub async fn has_blob(&self, hash: &str) -> bool {
-        crate::attest::check_hex(hash).is_ok() && tokio::fs::try_exists(self.blob_path(hash)).await.unwrap_or(false)
+    pub async fn write_batch(
+        &self,
+        id: &BatchId,
+        envelope: Bytes,
+        bundle: Bytes,
+    ) -> std::io::Result<()> {
+        write_atomic(&self.tmp, &self.batch_file(id, "envelope"), envelope).await?;
+        write_atomic(&self.tmp, &self.batch_file(id, "bundle"), bundle).await
     }
 
-    /// Digest-checked: a tampered file reads as absent.
-    pub async fn get_blob(&self, hash: &str) -> Option<Vec<u8>> {
-        crate::attest::check_hex(hash).ok()?;
-        let b = tokio::fs::read(self.blob_path(hash)).await.ok()?;
-        (sha256_hex(&b) == hash).then_some(b)
-    }
-
-    pub async fn put_blob(&self, hash: &str, data: &[u8]) -> Result<(), String> {
-        self.write_atomic(&self.blob_path(hash), data).await
-    }
-
-    pub async fn write_batch(&self, envelope_hash: &str, envelope: &[u8], bundle: &[u8]) -> Result<(), String> {
-        let b = self.dir.join("batches");
-        self.write_atomic(&b.join(format!("{envelope_hash}.envelope")), envelope).await?;
-        self.write_atomic(&b.join(format!("{envelope_hash}.bundle")), bundle).await
-    }
-
-    /// Queues a registry plan (opaque JSON) for `hartland promote`.
-    pub async fn write_outbox(&self, plan: &[u8]) -> Result<(), String> {
-        let name = format!("{}.json", sha256_hex(plan));
-        self.write_atomic(&self.dir.join("outbox").join(name), plan).await
-    }
-
-    /// Queued plans, with their paths (remove once done).
-    pub async fn outbox(&self) -> Vec<(PathBuf, Vec<u8>)> {
-        let mut out = Vec::new();
-        let Ok(mut rd) = tokio::fs::read_dir(self.dir.join("outbox")).await else { return out };
-        while let Ok(Some(e)) = rd.next_entry().await {
-            if let Ok(b) = tokio::fs::read(e.path()).await {
-                out.push((e.path(), b));
-            }
-        }
-        out
-    }
-
-    /// Envelope hashes the outbox still refers to (kept by `prune`).
-    async fn outbox_batches(&self) -> HashSet<String> {
-        let mut out = HashSet::new();
-        for (_, b) in self.outbox().await {
-            if let Ok(serde_json::Value::Array(jobs)) = serde_json::from_slice(&b) {
-                out.extend(jobs.iter().filter_map(|j| j.get("envelope")?.as_str().map(str::to_string)));
-            }
-        }
-        out
-    }
-
-    /// Every batch that verifies, newest first.
-    pub async fn load(&self, jwks: &Jwks, keyring: &Keyring) -> Vec<VerifiedBatch> {
-        let mut found = Vec::new();
-        let Ok(mut rd) = tokio::fs::read_dir(self.dir.join("batches")).await else { return Vec::new() };
-        while let Ok(Some(e)) = rd.next_entry().await {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(hash) = name.strip_suffix(".envelope") else { continue };
-            let modified = e.metadata().await.ok().and_then(|m| m.modified().ok());
-            found.push((modified, hash.to_string()));
-        }
-        found.sort_by(|a, b| b.0.cmp(&a.0));
-        let mut out = Vec::new();
-        for (_, hash) in found {
-            let b = self.dir.join("batches");
-            let (Ok(env), Ok(bundle)) =
-                (tokio::fs::read(b.join(format!("{hash}.envelope"))).await, tokio::fs::read(b.join(format!("{hash}.bundle"))).await)
+    /// Batch ids present, newest first.
+    async fn batch_ids(&self) -> std::io::Result<Vec<BatchId>> {
+        let mut found: Vec<(Option<SystemTime>, BatchId)> = Vec::new();
+        let mut rd = tokio::fs::read_dir(&self.batches).await?;
+        while let Some(e) = rd.next_entry().await? {
+            let Some(id) = e
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".envelope"))
+                .and_then(|h| h.parse().ok())
             else {
                 continue;
             };
-            if sha256_hex(&env) != hash {
+            found.push((e.metadata().await?.modified().ok(), id));
+        }
+        found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+        Ok(found.into_iter().map(|(_, id)| id).collect())
+    }
+
+    /// Every batch that verifies, newest first. Anything else is skipped.
+    pub async fn load(&self, jwks: &Jwks, keyring: &Keyring) -> Vec<VerifiedBatch> {
+        let mut out = Vec::new();
+        for id in self.batch_ids().await.unwrap_or_default() {
+            let (Ok(envelope), Ok(bundle)) = (
+                tokio::fs::read(self.batch_file(&id, "envelope")).await,
+                tokio::fs::read(self.batch_file(&id, "bundle")).await,
+            ) else {
                 continue;
-            }
-            if let Some(v) = accept(&hash, &env, &bundle, jwks, keyring) {
-                out.push(v);
+            };
+            match VerifiedBatch::accept(envelope.into(), &bundle, jwks, keyring) {
+                Ok(v) if v.id == id => out.push(v),
+                Ok(_) => {
+                    tracing::warn!(batch = %id, "first tier: envelope does not match its name; skipped")
+                }
+                Err(e) => {
+                    tracing::warn!(batch = %id, error = %e, "first tier: batch does not verify; skipped")
+                }
             }
         }
         out
     }
 
-    /// Keeps the newest `keep` batches, any the outbox still needs, and the
-    /// blobs they reference.
-    pub async fn prune(&self, keep: usize, jwks: &Jwks, keyring: &Keyring) -> Result<(), String> {
+    /// Keeps the newest `keep` batches plus `also`, and the blobs they need.
+    pub async fn prune(
+        &self,
+        keep: usize,
+        also: &HashSet<BatchId>,
+        jwks: &Jwks,
+        keyring: &Keyring,
+    ) -> std::io::Result<()> {
         let batches = self.load(jwks, keyring).await;
-        let queued = self.outbox_batches().await;
-        let b = self.dir.join("batches");
-        let mut live = HashSet::new();
-        let mut kept = HashSet::new();
-        for (i, v) in batches.iter().enumerate() {
-            if i >= keep && !queued.contains(&v.envelope_hash) {
-                continue;
-            }
-            kept.insert(v.envelope_hash.clone());
-            for (_, _, blobs) in &v.results {
-                live.extend(blobs.iter().cloned());
+        let kept: Vec<&VerifiedBatch> = batches
+            .iter()
+            .enumerate()
+            .filter(|(i, b)| *i < keep || also.contains(&b.id))
+            .map(|(_, b)| b)
+            .collect();
+        let kept_ids: HashSet<BatchId> = kept.iter().map(|b| b.id).collect();
+        let live: HashSet<Sha256> = kept
+            .iter()
+            .flat_map(|b| b.results.iter().flat_map(|r| r.blobs.iter().copied()))
+            .collect();
+        let mut rd = tokio::fs::read_dir(&self.batches).await?;
+        while let Some(e) = rd.next_entry().await? {
+            let id = e
+                .file_name()
+                .to_str()
+                .and_then(|n| n.split('.').next())
+                .and_then(|h| h.parse::<BatchId>().ok());
+            if !id.is_some_and(|id| kept_ids.contains(&id)) {
+                tokio::fs::remove_file(e.path()).await?;
             }
         }
-        let mut rd = tokio::fs::read_dir(&b).await.map_err(|e| e.to_string())?;
-        while let Ok(Some(e)) = rd.next_entry().await {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let hash = name.split('.').next().unwrap_or("");
-            if !kept.contains(hash) {
-                let _ = tokio::fs::remove_file(e.path()).await;
-            }
-        }
-        let mut shards = tokio::fs::read_dir(self.dir.join("blobs")).await.map_err(|e| e.to_string())?;
-        while let Ok(Some(shard)) = shards.next_entry().await {
-            let Ok(mut files) = tokio::fs::read_dir(shard.path()).await else { continue };
-            while let Ok(Some(f)) = files.next_entry().await {
-                if !live.contains(&f.file_name().to_string_lossy().into_owned()) {
-                    let _ = tokio::fs::remove_file(f.path()).await;
+        self.blobs.retain(&live).await
+    }
+
+    pub async fn put_blob(&self, blob: &Blob) -> std::io::Result<()> {
+        self.blobs.put(blob).await
+    }
+
+    /// Queues a plan for `hartland proxy promote`.
+    pub async fn enqueue<T: Serialize>(&self, plan: &T) -> std::io::Result<()> {
+        let bytes = Bytes::from(serde_json::to_vec(plan).map_err(std::io::Error::other)?);
+        write_atomic(
+            &self.tmp,
+            &self.outbox.join(format!("{}.json", Sha256::of(&bytes))),
+            bytes,
+        )
+        .await
+    }
+
+    /// Queued plans. Unreadable ones are dropped with a warning.
+    pub async fn queued<T: DeserializeOwned>(&self) -> std::io::Result<Vec<Queued<T>>> {
+        let mut out = Vec::new();
+        let mut rd = tokio::fs::read_dir(&self.outbox).await?;
+        while let Some(e) = rd.next_entry().await? {
+            match serde_json::from_slice(&tokio::fs::read(e.path()).await?) {
+                Ok(plan) => out.push(Queued {
+                    plan,
+                    path: e.path(),
+                }),
+                Err(err) => {
+                    tracing::warn!(path = %e.path().display(), error = %err, "unreadable outbox plan: dropped");
+                    tokio::fs::remove_file(e.path()).await?;
                 }
             }
         }
-        Ok(())
+        Ok(out)
+    }
+
+    pub async fn done<T>(&self, q: Queued<T>) -> std::io::Result<()> {
+        tokio::fs::remove_file(q.path).await
     }
 }

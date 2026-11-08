@@ -3,10 +3,10 @@
 //!
 //! Registry layout in a namespace such as `ghcr.io/<owner>/hartland-cache`:
 //!   * CAS blobs are registry blobs (REAPI and OCI digests are both sha256).
-//!   * An action-cache entry is a manifest tagged with the action hash. Its
+//!   * An action-cache entry is a manifest tagged with the action digest. Its
 //!     config is the exact serialised ActionResult; its layers are every blob
 //!     the result needs (so the registry keeps them) plus the signed batch
-//!     envelope; the annotation `ANN_ENVELOPE` names the envelope.
+//!     envelope, which the annotation `ANN_ENVELOPE` names.
 //!   * `hartland-index` lists (envelope, bundle) pairs for recent batches, so
 //!     a reader loads a batch with one request instead of one per action.
 //!
@@ -15,34 +15,44 @@
 //! exact result bytes. Blobs are content-addressed and digest-checked.
 //!
 //! Writes: kept locally; `publish` signs one batch with the job's OIDC token,
-//! writes it to the first tier, and promotes to the registry per `Promote`.
+//! saves it to the first tier, and plans what the registry should receive
+//! (per `Promote`). With a first tier the plan is queued in its outbox, for
+//! `drain_outbox` to push after the build, off its critical path.
 
-use crate::attest::{ActionResult as Pair, Digest, Envelope, Statement, sha256_hex};
+use crate::attest::{Batch, Envelope, Pair};
+use crate::bundle::{CachedResult, VerifiedBatch, bundle_bytes};
+use crate::cas::Blob;
+use crate::digest::{ActionDigest, ActionId, BatchId, Digest, Sha256};
 use crate::jwt::Jwks;
 use crate::keyring::Keyring;
-use crate::l1::{self, L1};
-use crate::oci::{MANIFEST_MEDIA_TYPE, Registry};
-use crate::proxy::{DiskStore, EMPTY_SHA256, Store};
+use crate::l1::L1;
+use crate::oci::{Reference, Registry, Tag};
+use crate::proxy::{DiskStore, Store, StoreError, direct_blobs};
 use crate::reapi::re;
+use bytes::Bytes;
+use dashmap::{DashMap, DashSet};
 use futures::{StreamExt as _, TryStreamExt as _};
+use oci_spec::image::{
+    Descriptor, DescriptorBuilder, ImageManifest, ImageManifestBuilder, MediaType,
+};
 use prost::Message as _;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Mutex;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use tokio::sync::OnceCell;
 
-pub const ARTIFACT_TYPE: &str = "application/vnd.hartland.action-result.v0";
-pub const CONFIG_MEDIA_TYPE: &str = "application/vnd.hartland.reapi.action-result.v2+proto";
-pub const ENVELOPE_MEDIA_TYPE: &str = crate::attest::ENVELOPE_MEDIA_TYPE;
-pub const ANN_ENVELOPE: &str = "dev.hartland.envelope";
-pub const BUNDLE_MEDIA_TYPE: &str = "application/vnd.hartland.batch-bundle.v0+json";
-pub const INDEX_ARTIFACT_TYPE: &str = "application/vnd.hartland.index.v0";
-pub const INDEX_TAG: &str = "hartland-index";
+const ARTIFACT_TYPE: &str = "application/vnd.hartland.action-result.v0";
+const CONFIG_MEDIA_TYPE: &str = "application/vnd.hartland.reapi.action-result.v2+proto";
+const ENVELOPE_MEDIA_TYPE: &str = crate::attest::ENVELOPE_MEDIA_TYPE;
+const ANN_ENVELOPE: &str = "dev.hartland.envelope";
+const BUNDLE_MEDIA_TYPE: &str = "application/vnd.hartland.batch-bundle.v0+json";
+const INDEX_ARTIFACT_TYPE: &str = "application/vnd.hartland.index.v0";
+const INDEX_TAG: &str = "hartland-index";
 const INDEX_MAX_BATCHES: usize = 50;
 const L1_MAX_BATCHES: usize = 100;
 const REGISTRY_CONCURRENCY: usize = 16;
-const READ_ATTEMPTS: u32 = 3;
 
 /// Which results go to the registry (the shared, durable tier).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Promote {
     /// Everything: builds of the default branch.
     All,
@@ -53,19 +63,74 @@ pub enum Promote {
     None,
 }
 
-impl std::str::FromStr for Promote {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Promote, String> {
-        match s {
-            "all" => Ok(Promote::All),
-            "reused" => Ok(Promote::Reused),
-            "none" => Ok(Promote::None),
-            o => Err(format!("--promote wants all|reused|none, got {o}")),
+/// What the registry holds of a result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InRegistry {
+    No,
+    /// Listed in an index: a reader finds it with one request per batch.
+    Indexed,
+    /// Only its per-action manifest: worth indexing once used.
+    ManifestOnly,
+}
+
+/// A trusted result and what we know about where it is.
+struct Known {
+    result: CachedResult,
+    batch: BatchId,
+    in_first_tier: bool,
+    in_registry: InRegistry,
+    built_here: bool,
+    /// Served to a client this run.
+    used: bool,
+}
+
+/// Registry writes to make: batches (restricted to some actions) to push in
+/// full, and batches already pushed whose entries only need indexing.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Plan {
+    push: BTreeMap<BatchId, BTreeSet<ActionId>>,
+    index: BTreeMap<BatchId, BTreeSet<ActionId>>,
+}
+
+impl Plan {
+    fn is_empty(&self) -> bool {
+        self.push.is_empty() && self.index.is_empty()
+    }
+
+    fn results(&self) -> usize {
+        self.push
+            .values()
+            .chain(self.index.values())
+            .map(BTreeSet::len)
+            .sum()
+    }
+
+    fn batches(&self) -> impl Iterator<Item = BatchId> + '_ {
+        self.push.keys().chain(self.index.keys()).copied()
+    }
+
+    /// Unions plans. Pushing a batch indexes it too, so indexing a batch
+    /// that is also pushed is dropped.
+    fn merge(plans: impl IntoIterator<Item = Plan>) -> Plan {
+        let mut out = Plan::default();
+        for p in plans {
+            for (b, a) in p.push {
+                out.push.entry(b).or_default().extend(a);
+            }
+            for (b, a) in p.index {
+                out.index.entry(b).or_default().extend(a);
+            }
         }
+        out.index.retain(|b, _| !out.push.contains_key(b));
+        out
     }
 }
 
-type Entry = (String, re::ActionResult, Vec<String>);
+/// Results this process executed, awaiting a signed batch.
+struct Pending {
+    action: ActionDigest,
+    result: re::ActionResult,
+}
 
 pub struct GhcrStore {
     local: DiskStore,
@@ -75,47 +140,35 @@ pub struct GhcrStore {
     jwks: Jwks,
     l1: Option<L1>,
     promote: Promote,
-    /// Results executed this run, awaiting a signed batch.
-    pending: Mutex<Vec<(String, i64, re::ActionResult)>>,
-    /// Envelope digest -> verified statement pairs (per-action lookups).
-    verified: Mutex<HashMap<String, HashMap<String, String>>>,
-    /// Verified results from indexes and the first tier.
-    indexed: Mutex<HashMap<String, re::ActionResult>>,
-    /// Blobs verified results reference: present, fetched on demand.
-    known: Mutex<HashSet<String>>,
-    /// Registry results served via per-action lookup, by envelope: re-indexed.
-    reindex: Mutex<HashMap<String, HashMap<String, re::ActionResult>>>,
-    /// First-tier results: action -> envelope hash, and the envelopes.
-    l1_origin: Mutex<HashMap<String, String>>,
-    l1_envelopes: Mutex<HashMap<String, Vec<u8>>>,
-    /// First-tier results served this run (candidates for promotion).
-    reused: Mutex<HashSet<String>>,
-    /// Registry results: action -> envelope hash; and those served this run,
-    /// which are written through to the first tier.
-    registry_origin: Mutex<HashMap<String, String>>,
-    served_remote: Mutex<HashSet<String>>,
-    /// Set once every reader's index has been read (see `load_registry`).
-    registry_loaded: tokio::sync::OnceCell<usize>,
+    pending: Mutex<Vec<Pending>>,
+    known: DashMap<ActionId, Known>,
+    envelopes: DashMap<BatchId, Bytes>,
+    /// Blobs that known results reference: present somewhere, fetched on
+    /// demand.
+    referenced: DashSet<Sha256>,
+    /// Verified statements, for per-action registry lookups.
+    statements: DashMap<BatchId, Arc<Batch>>,
+    /// Every reader's index has been read (see `load_registry`).
+    registry_loaded: OnceCell<()>,
 }
 
-async fn get_blob_retrying(reg: &Registry, hash: &str) -> Result<Vec<u8>, String> {
-    let mut last = String::new();
-    for attempt in 0..READ_ATTEMPTS {
-        match reg.get_blob(hash).await {
-            Ok(b) => return Ok(b),
-            Err(e) => last = e,
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200 << attempt)).await;
-    }
-    Err(last)
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+fn descriptor(media_type: &str, digest: Sha256, size: usize) -> Descriptor {
+    DescriptorBuilder::default()
+        .media_type(MediaType::Other(media_type.to_string()))
+        .digest(digest.oci())
+        .size(size as u64)
+        .build()
+        .expect("a descriptor with media type, digest and size")
 }
 
 impl GhcrStore {
-    pub fn new(local: DiskStore, readers: Vec<Registry>, writer: Option<Registry>, keyring: Keyring, jwks: Jwks) -> GhcrStore {
+    pub fn new(
+        local: DiskStore,
+        readers: Vec<Registry>,
+        writer: Option<Registry>,
+        keyring: Keyring,
+        jwks: Jwks,
+    ) -> GhcrStore {
         GhcrStore {
             local,
             readers,
@@ -125,501 +178,578 @@ impl GhcrStore {
             l1: None,
             promote: Promote::All,
             pending: Mutex::default(),
-            verified: Mutex::default(),
-            indexed: Mutex::default(),
-            known: Mutex::default(),
-            reindex: Mutex::default(),
-            l1_origin: Mutex::default(),
-            l1_envelopes: Mutex::default(),
-            reused: Mutex::default(),
-            registry_origin: Mutex::default(),
-            served_remote: Mutex::default(),
-            registry_loaded: tokio::sync::OnceCell::new(),
+            known: DashMap::new(),
+            envelopes: DashMap::new(),
+            referenced: DashSet::new(),
+            statements: DashMap::new(),
+            registry_loaded: OnceCell::new(),
         }
     }
 
-    pub fn with_l1(mut self, l1: Option<L1>, promote: Promote) -> GhcrStore {
-        self.l1 = l1;
-        self.promote = promote;
-        self
+    pub fn with_first_tier(self, l1: L1, promote: Promote) -> GhcrStore {
+        GhcrStore {
+            l1: Some(l1),
+            promote,
+            ..self
+        }
     }
 
-    fn accept_batch(&self, v: l1::VerifiedBatch, from_l1: bool) -> usize {
-        let n = v.results.len();
-        let (mut idx, mut known) = (lock(&self.indexed), lock(&self.known));
-        for (action, result, blobs) in v.results {
-            known.extend(blobs);
-            if from_l1 {
-                lock(&self.l1_origin).insert(action.clone(), v.envelope_hash.clone());
-            } else {
-                lock(&self.registry_origin).entry(action.clone()).or_insert_with(|| v.envelope_hash.clone());
+    pub fn known(&self) -> usize {
+        self.known.len()
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Vec<Pending>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records a verified batch from the first tier or a registry index.
+    fn absorb(&self, batch: VerifiedBatch, from_first_tier: bool) {
+        for r in batch.results {
+            for h in &r.blobs {
+                self.referenced.insert(*h);
             }
-            idx.entry(action).or_insert(result);
+            self.known
+                .entry(r.action)
+                .and_modify(|k| {
+                    if from_first_tier {
+                        k.in_first_tier = true;
+                    } else {
+                        k.in_registry = InRegistry::Indexed;
+                    }
+                })
+                .or_insert_with(|| Known {
+                    result: r,
+                    batch: batch.id,
+                    in_first_tier: from_first_tier,
+                    in_registry: if from_first_tier {
+                        InRegistry::No
+                    } else {
+                        InRegistry::Indexed
+                    },
+                    built_here: false,
+                    used: false,
+                });
         }
-        if from_l1 {
-            lock(&self.l1_envelopes).insert(v.envelope_hash, v.envelope);
-        }
-        n
+        self.envelopes.insert(batch.id, batch.envelope);
     }
 
-    /// Loads the first tier, then every reader's index. Returns the number of
-    /// verified results now servable.
-    pub async fn load(&self) -> usize {
-        self.load_l1().await;
-        self.load_registry().await
-    }
-
-    /// Loads the first tier only: enough to start serving. The registry
-    /// indexes are needed only on a first-tier miss and when publishing, so
-    /// they can be read in the background (`load_registry`).
-    pub async fn load_l1(&self) -> usize {
+    /// Loads the first tier: enough to start serving. Registry indexes are
+    /// needed only on a first-tier miss and when publishing, so they can be
+    /// read in the background (`load_registry`).
+    pub async fn load_first_tier(&self) {
         if let Some(l1) = &self.l1 {
-            for v in l1.load(&self.jwks, &self.keyring).await {
-                self.accept_batch(v, true);
+            for b in l1.load(&self.jwks, &self.keyring).await {
+                self.absorb(b, true);
             }
-            tracing::info!(results = lock(&self.indexed).len(), "first tier loaded");
+            tracing::info!(results = self.known.len(), "first tier loaded");
         }
-        lock(&self.indexed).len()
     }
 
     /// Reads every reader's index, once; concurrent callers wait for the
-    /// same read. Returns the number of verified results then servable.
-    pub async fn load_registry(&self) -> usize {
-        *self.registry_loaded.get_or_init(|| self.read_indexes()).await
+    /// same read.
+    pub async fn load_registry(&self) {
+        self.registry_loaded
+            .get_or_init(|| self.read_indexes())
+            .await;
     }
 
-    async fn read_indexes(&self) -> usize {
+    async fn read_indexes(&self) {
         let started = tokio::time::Instant::now();
         for reg in &self.readers {
-            let Ok(reply) = reg.get_manifest(INDEX_TAG).await else { continue };
-            if reply.status != 200 {
-                continue;
-            }
-            let Ok(m) = serde_json::from_slice::<serde_json::Value>(&reply.body) else { continue };
-            let layers: Vec<(String, String)> = m
-                .get("layers")
-                .and_then(|l| l.as_array())
-                .map(|l| {
-                    l.iter()
-                        .filter_map(|x| Some((x.get("mediaType")?.as_str()?.to_string(), x.get("digest")?.as_str()?.strip_prefix("sha256:")?.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let batches: Vec<(String, String)> = layers
+            let index = match reg
+                .get_manifest(&Reference::Tag(INDEX_TAG.parse().expect("a valid tag")))
+                .await
+            {
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(registry = %reg.name(), error = %e, "cannot read index");
+                    continue;
+                }
+            };
+            let pairs: Vec<(Sha256, Sha256)> = index
+                .layers()
                 .windows(2)
-                .filter(|w| w[0].0 == ENVELOPE_MEDIA_TYPE && w[1].0 == BUNDLE_MEDIA_TYPE)
-                .map(|w| (w[0].1.clone(), w[1].1.clone()))
+                .filter(|w| {
+                    w[0].media_type().to_string() == ENVELOPE_MEDIA_TYPE
+                        && w[1].media_type().to_string() == BUNDLE_MEDIA_TYPE
+                })
+                .filter_map(|w| {
+                    Some((
+                        Sha256::from_oci(w[0].digest()).ok()?,
+                        Sha256::from_oci(w[1].digest()).ok()?,
+                    ))
+                })
                 .collect();
-            futures::stream::iter(batches)
-                .map(|(env, bundle)| async move {
-                    let (Ok(e), Ok(b)) = (get_blob_retrying(reg, &env).await, get_blob_retrying(reg, &bundle).await) else { return };
-                    if sha256_hex(&e) != env {
-                        return;
-                    }
-                    if let Some(v) = l1::accept(&env, &e, &b, &self.jwks, &self.keyring) {
-                        let _ = self.local.put_blob(&env, &e).await;
-                        self.accept_batch(v, false);
+            futures::stream::iter(pairs)
+                .for_each_concurrent(4, |(envelope, bundle)| async move {
+                    let (Ok(Some(e)), Ok(Some(b))) = (reg.get_blob(&envelope).await, reg.get_blob(&bundle).await) else { return };
+                    match VerifiedBatch::accept(e, &b, &self.jwks, &self.keyring) {
+                        Ok(v) => self.absorb(v, false),
+                        Err(err) => tracing::warn!(batch = %envelope, error = %err, "index batch does not verify; skipped"),
                     }
                 })
-                .buffer_unordered(4)
-                .collect::<Vec<()>>()
                 .await;
         }
-        let n = lock(&self.indexed).len();
-        tracing::info!(results = n, elapsed = ?started.elapsed(), "registry indexes loaded");
-        n
+        tracing::info!(results = self.known.len(), elapsed = ?started.elapsed(), "registry indexes loaded");
     }
 
     /// local -> first tier -> registries (keeping a local copy).
-    async fn any_blob(&self, hash: &str) -> Option<Vec<u8>> {
+    async fn any_blob(&self, hash: &Sha256) -> Option<Blob> {
         if let Some(b) = self.local.get_blob(hash).await {
             return Some(b);
         }
+        let mut found = None;
         if let Some(l1) = &self.l1 {
-            if let Some(b) = l1.get_blob(hash).await {
-                let _ = self.local.put_blob(hash, &b).await;
-                return Some(b);
-            }
+            found = l1.blobs().get(hash).await;
         }
         for r in &self.readers {
-            if let Ok(b) = get_blob_retrying(r, hash).await {
-                let _ = self.local.put_blob(hash, &b).await;
-                return Some(b);
+            if found.is_some() {
+                break;
             }
+            found = r
+                .get_blob(hash)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|data| Blob::check_hash(*hash, data).ok());
         }
-        None
+        let blob = found?;
+        let _ = self.local.put_blob(&blob).await;
+        Some(blob)
     }
 
-    async fn verified_pairs(&self, reg: &Registry, envelope_hash: &str) -> Option<HashMap<String, String>> {
-        if let Some(p) = lock(&self.verified).get(envelope_hash) {
-            return Some(p.clone());
+    async fn need_blob(&self, hash: &Sha256) -> Result<Blob, StoreError> {
+        self.any_blob(hash)
+            .await
+            .ok_or(StoreError::Unavailable(*hash))
+    }
+
+    async fn statement(&self, reg: &Registry, id: BatchId) -> Option<Arc<Batch>> {
+        if let Some(b) = self.statements.get(&id) {
+            return Some(b.clone());
         }
-        let bytes = get_blob_retrying(reg, envelope_hash).await.ok()?;
-        let _ = self.local.put_blob(envelope_hash, &bytes).await;
-        let env: Envelope = serde_json::from_slice(&bytes).ok()?;
-        let (statement, _signer) = crate::verify_envelope(&env, &self.jwks, &self.keyring).ok()?;
-        let pairs: HashMap<String, String> = statement.predicate.results.into_iter().map(|p| (p.action.hash, p.result.hash)).collect();
-        lock(&self.verified).insert(envelope_hash.to_string(), pairs.clone());
-        Some(pairs)
+        let bytes = reg.get_blob(&id.0).await.ok()??;
+        let batch: Arc<Batch> = Arc::new(
+            Envelope::parse(&bytes)
+                .ok()?
+                .verify(&self.jwks, &self.keyring)
+                .ok()?
+                .statement,
+        );
+        self.envelopes.insert(id, bytes);
+        self.statements.insert(id, batch.clone());
+        Some(batch)
     }
 
     /// The slow path: one action's manifest from a registry.
-    async fn lookup(&self, reg: &Registry, action: &str) -> Option<re::ActionResult> {
-        let reply = reg.get_manifest(action).await.ok()?;
-        if reply.status != 200 {
+    async fn lookup(&self, reg: &Registry, action: ActionId) -> Option<re::ActionResult> {
+        let m = reg
+            .get_manifest(&Reference::Tag(Tag::from(action.0)))
+            .await
+            .ok()??;
+        if m.artifact_type()
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref()
+            != Some(ARTIFACT_TYPE)
+        {
             return None;
         }
-        let m: serde_json::Value = serde_json::from_slice(&reply.body).ok()?;
-        if m.get("artifactType")?.as_str()? != ARTIFACT_TYPE {
+        let batch_id = BatchId(
+            m.annotations()
+                .as_ref()?
+                .get(ANN_ENVELOPE)?
+                .strip_prefix("sha256:")?
+                .parse()
+                .ok()?,
+        );
+        let config = Sha256::from_oci(m.config().digest()).ok()?;
+        let statement = self.statement(reg, batch_id).await?;
+        let bytes = reg.get_blob(&config).await.ok()??;
+        if !statement.vouches(&action, &bytes) {
             return None;
         }
-        let env_hash = m.pointer(&format!("/annotations/{}", ANN_ENVELOPE.replace('/', "~1")))?.as_str()?.strip_prefix("sha256:")?;
-        let config_hash = m.pointer("/config/digest")?.as_str()?.strip_prefix("sha256:")?;
-        let pairs = self.verified_pairs(reg, env_hash).await?;
-        if pairs.get(action).map(String::as_str) != Some(config_hash) {
-            return None;
+        let result = re::ActionResult::decode(bytes).ok()?;
+        // The manifest's layers retain every blob the result needs.
+        let blobs: BTreeSet<Sha256> = m
+            .layers()
+            .iter()
+            .filter_map(|l| Sha256::from_oci(l.digest()).ok())
+            .filter(|h| *h != batch_id.0)
+            .collect();
+        for h in &blobs {
+            self.referenced.insert(*h);
         }
-        let bytes = get_blob_retrying(reg, config_hash).await.ok()?;
-        let result = re::ActionResult::decode(bytes.as_slice()).ok()?;
-        // Its manifest's layers retain every blob it needs: present.
-        if let Some(layers) = m.get("layers").and_then(|l| l.as_array()) {
-            let mut known = lock(&self.known);
-            for l in layers {
-                if let Some(h) = l.get("digest").and_then(|d| d.as_str()).and_then(|d| d.strip_prefix("sha256:")) {
-                    known.insert(h.to_string());
-                }
-            }
-        }
-        lock(&self.reindex).entry(env_hash.to_string()).or_default().insert(action.to_string(), result.clone());
-        lock(&self.indexed).insert(action.to_string(), result.clone());
-        lock(&self.registry_origin).entry(action.to_string()).or_insert_with(|| env_hash.to_string());
-        lock(&self.served_remote).insert(action.to_string());
+        self.known.insert(
+            action,
+            Known {
+                result: CachedResult {
+                    action,
+                    result: result.clone(),
+                    blobs,
+                },
+                batch: batch_id,
+                in_first_tier: false,
+                in_registry: InRegistry::ManifestOnly,
+                built_here: false,
+                used: true,
+            },
+        );
         Some(result)
     }
 
     /// Every blob an action result needs: outputs, stdout/stderr, and for each
     /// output directory its Tree and every file inside it.
-    async fn referenced_blobs(&self, r: &re::ActionResult) -> Result<Vec<String>, String> {
-        let mut out = BTreeSet::new();
-        out.extend(r.output_files.iter().filter_map(|f| f.digest.as_ref().map(|d| d.hash.clone())));
-        out.extend(r.stdout_digest.iter().chain(r.stderr_digest.iter()).map(|d| d.hash.clone()));
+    async fn referenced_blobs(&self, r: &re::ActionResult) -> Result<BTreeSet<Sha256>, StoreError> {
+        let mut out = direct_blobs(r)?;
         for dir in &r.output_directories {
-            let Some(td) = &dir.tree_digest else { continue };
-            out.insert(td.hash.clone());
-            let bytes = self.any_blob(&td.hash).await.ok_or_else(|| format!("tree {} unavailable", td.hash))?;
-            let tree = re::Tree::decode(bytes.as_slice()).map_err(|e| format!("bad tree {}: {e}", td.hash))?;
-            for d in tree.root.iter().chain(tree.children.iter()) {
-                out.extend(d.files.iter().filter_map(|f| f.digest.as_ref().map(|d| d.hash.clone())));
+            let tree = Digest::try_from(dir.tree_digest.as_ref())?.hash;
+            let tree = re::Tree::decode(self.need_blob(&tree).await?.into_data())?;
+            for d in tree.root.iter().chain(&tree.children) {
+                for f in &d.files {
+                    out.insert(Digest::try_from(f.digest.as_ref())?.hash);
+                }
             }
         }
-        out.remove(EMPTY_SHA256);
-        Ok(out.into_iter().collect())
+        out.remove(&Sha256::EMPTY);
+        Ok(out)
     }
 
-    /// Pushes a signed batch to a registry: envelope, blobs, results,
-    /// per-action manifests, bundle, index entry.
-    async fn push_batch(&self, writer: &Registry, env_hash: &str, envelope: &[u8], entries: &[Entry]) -> Result<(), String> {
-        writer.put_blob(envelope).await?;
-        let all: BTreeSet<String> = entries.iter().flat_map(|(_, _, b)| b.iter().cloned()).collect();
-        let sizes: HashMap<String, usize> = futures::stream::iter(all)
+    fn results_of<'a>(&self, actions: impl IntoIterator<Item = &'a ActionId>) -> Vec<CachedResult> {
+        actions
+            .into_iter()
+            .filter_map(|a| self.known.get(a).map(|k| k.result.clone()))
+            .collect()
+    }
+
+    async fn envelope(&self, id: &BatchId) -> Option<Bytes> {
+        if let Some(e) = self.envelopes.get(id) {
+            return Some(e.clone());
+        }
+        self.any_blob(&id.0).await.map(Blob::into_data)
+    }
+
+    /// Pushes a signed batch: envelope, blobs, results, per-action
+    /// manifests, bundle, index entry.
+    async fn push_batch(
+        &self,
+        writer: &Registry,
+        id: BatchId,
+        envelope: Bytes,
+        results: &[CachedResult],
+    ) -> Result<(), StoreError> {
+        let envelope_layer = descriptor(
+            ENVELOPE_MEDIA_TYPE,
+            writer.put_blob(envelope.clone()).await?,
+            envelope.len(),
+        );
+        let all: BTreeSet<Sha256> = results
+            .iter()
+            .flat_map(|r| r.blobs.iter().copied())
+            .collect();
+        let sizes: HashMap<Sha256, usize> = futures::stream::iter(all)
             .map(|h| async move {
-                let data = self.any_blob(&h).await.ok_or_else(|| format!("blob {h} unavailable"))?;
-                writer.put_blob(&data).await?;
-                Ok::<_, String>((h, data.len()))
+                let blob = self.need_blob(&h).await?;
+                let size = blob.data().len();
+                writer.put_blob(blob.into_data()).await?;
+                Ok::<_, StoreError>((h, size))
             })
             .buffer_unordered(REGISTRY_CONCURRENCY)
             .try_collect()
             .await?;
-        let configs: Vec<Vec<u8>> = entries.iter().map(|(_, r, _)| r.encode_to_vec()).collect();
-        futures::stream::iter(&configs).map(|c| writer.put_blob(c)).buffer_unordered(REGISTRY_CONCURRENCY).try_collect::<Vec<_>>().await?;
-        let mut manifests = Vec::new();
-        for ((action, _, blobs), config) in entries.iter().zip(&configs) {
-            let mut layers: Vec<serde_json::Value> = blobs
-                .iter()
-                .map(|h| serde_json::json!({"mediaType": "application/octet-stream", "digest": format!("sha256:{h}"), "size": sizes[h]}))
-                .collect();
-            layers.push(serde_json::json!({"mediaType": ENVELOPE_MEDIA_TYPE, "digest": format!("sha256:{env_hash}"), "size": envelope.len()}));
-            let manifest = serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": MANIFEST_MEDIA_TYPE,
-                "artifactType": ARTIFACT_TYPE,
-                "config": {"mediaType": CONFIG_MEDIA_TYPE, "digest": format!("sha256:{}", sha256_hex(config)), "size": config.len()},
-                "layers": layers,
-                "annotations": {ANN_ENVELOPE: format!("sha256:{env_hash}")},
-            });
-            manifests.push((action.clone(), serde_json::to_vec(&manifest).map_err(|e| e.to_string())?));
-        }
-        futures::stream::iter(&manifests)
-            .map(|(a, m)| writer.put_manifest(a, MANIFEST_MEDIA_TYPE, m))
+        futures::stream::iter(results)
+            .map(|r| async {
+                let config = Bytes::from(r.result.encode_to_vec());
+                let config_digest = writer.put_blob(config.clone()).await?;
+                let mut layers: Vec<Descriptor> = r
+                    .blobs
+                    .iter()
+                    .map(|h| descriptor("application/octet-stream", *h, sizes[h]))
+                    .collect();
+                layers.push(envelope_layer.clone());
+                let manifest = ImageManifestBuilder::default()
+                    .schema_version(2u32)
+                    .media_type(MediaType::ImageManifest)
+                    .artifact_type(MediaType::Other(ARTIFACT_TYPE.to_string()))
+                    .config(descriptor(CONFIG_MEDIA_TYPE, config_digest, config.len()))
+                    .layers(layers)
+                    .annotations(HashMap::from([(
+                        ANN_ENVELOPE.to_string(),
+                        format!("sha256:{id}"),
+                    )]))
+                    .build()
+                    .expect("a complete manifest");
+                writer
+                    .put_manifest(&Reference::Tag(Tag::from(r.action.0)), &manifest)
+                    .await?;
+                Ok::<_, StoreError>(())
+            })
             .buffer_unordered(REGISTRY_CONCURRENCY)
-            .try_collect::<Vec<_>>()
+            .try_collect::<Vec<()>>()
             .await?;
-        let bundle = l1::bundle_bytes(entries)?;
-        let bundle_hash = writer.put_blob(&bundle).await?;
-        self.append_index(writer, (env_hash, envelope.len()), (&bundle_hash, bundle.len())).await
+        self.index_batch(writer, id, envelope, results).await
     }
 
-    /// Read-modify-write of the index manifest. Concurrent publishers can
-    /// drop each other's entry; per-action manifests still serve as fallback.
-    async fn append_index(&self, writer: &Registry, envelope: (&str, usize), bundle: (&str, usize)) -> Result<(), String> {
-        let mut layers: Vec<serde_json::Value> = match writer.get_manifest(INDEX_TAG).await {
-            Ok(r) if r.status == 200 => serde_json::from_slice::<serde_json::Value>(&r.body)
-                .ok()
-                .and_then(|m| m.get("layers").and_then(|l| l.as_array()).cloned())
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        let env_digest = format!("sha256:{}", envelope.0);
-        let bundle_digest = format!("sha256:{}", bundle.0);
-        let digest_at = |i: usize, layers: &Vec<serde_json::Value>| layers.get(i).and_then(|l| l.get("digest")).and_then(|d| d.as_str()).map(str::to_string);
-        if (0..layers.len()).any(|i| digest_at(i, &layers).as_deref() == Some(env_digest.as_str()) && digest_at(i + 1, &layers).as_deref() == Some(bundle_digest.as_str())) {
-            return Ok(()); // already indexed
+    /// Adds a batch's bundle to the index (read-modify-write: concurrent
+    /// publishers can drop each other's entry; per-action manifests remain).
+    async fn index_batch(
+        &self,
+        writer: &Registry,
+        id: BatchId,
+        envelope: Bytes,
+        results: &[CachedResult],
+    ) -> Result<(), StoreError> {
+        let bundle = bundle_bytes(results);
+        let bundle_layer = descriptor(
+            BUNDLE_MEDIA_TYPE,
+            writer.put_blob(bundle.clone()).await?,
+            bundle.len(),
+        );
+        let envelope_layer = descriptor(ENVELOPE_MEDIA_TYPE, id.0, envelope.len());
+        let tag = Reference::Tag(INDEX_TAG.parse().expect("a valid tag"));
+        let mut layers: Vec<Descriptor> = writer
+            .get_manifest(&tag)
+            .await?
+            .map(|m| m.layers().clone())
+            .unwrap_or_default();
+        if layers
+            .windows(2)
+            .any(|w| w[0] == envelope_layer && w[1] == bundle_layer)
+        {
+            return Ok(());
         }
-        layers.push(serde_json::json!({"mediaType": ENVELOPE_MEDIA_TYPE, "digest": format!("sha256:{}", envelope.0), "size": envelope.1}));
-        layers.push(serde_json::json!({"mediaType": BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{}", bundle.0), "size": bundle.1}));
-        let keep = INDEX_MAX_BATCHES * 2;
-        if layers.len() > keep {
-            layers.drain(..layers.len() - keep);
-        }
-        let empty = writer.put_blob(b"{}").await?;
-        let manifest = serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": MANIFEST_MEDIA_TYPE,
-            "artifactType": INDEX_ARTIFACT_TYPE,
-            "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": format!("sha256:{empty}"), "size": 2},
-            "layers": layers,
-        });
-        writer.put_manifest(INDEX_TAG, MANIFEST_MEDIA_TYPE, &serde_json::to_vec(&manifest).map_err(|e| e.to_string())?).await?;
+        layers.extend([envelope_layer, bundle_layer]);
+        let excess = layers.len().saturating_sub(INDEX_MAX_BATCHES * 2);
+        layers.drain(..excess);
+        let empty = writer.put_blob(Bytes::from_static(b"{}")).await?;
+        let index: ImageManifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .artifact_type(MediaType::Other(INDEX_ARTIFACT_TYPE.to_string()))
+            .config(descriptor("application/vnd.oci.empty.v1+json", empty, 2))
+            .layers(layers)
+            .build()
+            .expect("a complete manifest");
+        writer.put_manifest(&tag, &index).await?;
         Ok(())
     }
 
-    /// Writes a batch (and its blobs) to the first tier.
-    async fn save_l1(&self, env_hash: &str, envelope: &[u8], entries: &[Entry]) -> Result<(), String> {
-        let Some(l1) = &self.l1 else { return Ok(()) };
-        let all: BTreeSet<String> = entries.iter().flat_map(|(_, _, b)| b.iter().cloned()).collect();
+    /// Writes a batch (and the blobs its results need) to the first tier.
+    async fn save_first_tier(
+        &self,
+        l1: &L1,
+        id: BatchId,
+        envelope: Bytes,
+        results: &[CachedResult],
+    ) -> Result<(), StoreError> {
+        let all: BTreeSet<Sha256> = results
+            .iter()
+            .flat_map(|r| r.blobs.iter().copied())
+            .collect();
         futures::stream::iter(all)
-            .map(|h| async move {
-                let data = self.any_blob(&h).await.ok_or_else(|| format!("blob {h} unavailable"))?;
-                l1.put_blob(&h, &data).await
-            })
+            .map(|h| async move { Ok::<_, StoreError>(l1.put_blob(&self.need_blob(&h).await?).await?) })
             .buffer_unordered(32)
             .try_collect::<Vec<()>>()
             .await?;
-        l1.write_batch(env_hash, envelope, &l1::bundle_bytes(entries)?).await
+        Ok(l1.write_batch(&id, envelope, bundle_bytes(results)).await?)
     }
 
-    /// Signs this run's new results as one batch and saves it to the first
-    /// tier, then plans what to send to the registry per policy. With a first
-    /// tier the plan goes to its outbox, for `drain_outbox` (`hartland
-    /// promote`) to push after the build; without one it runs now. Returns
-    /// the number of new results signed.
-    pub async fn publish(&self) -> Result<usize, String> {
-        // Promotion and re-indexing compare against the registry indexes.
-        self.load_registry().await;
-        let pending: Vec<_> = std::mem::take(&mut *lock(&self.pending));
-        let mut plan: Vec<Job> = Vec::new();
-        if !pending.is_empty() {
-            if self.writer.is_none() && self.l1.is_none() {
-                return Err("results pending but nowhere to publish them".to_string());
-            }
-            let mut pairs = Vec::new();
-            let mut entries = Vec::new();
-            for (action, size, result) in &pending {
-                let bytes = result.encode_to_vec();
-                pairs.push(Pair {
-                    action: Digest { hash: action.clone(), size: *size as u64 },
-                    result: Digest { hash: sha256_hex(&bytes), size: bytes.len() as u64 },
-                });
-                entries.push((action.clone(), result.clone(), self.referenced_blobs(result).await?));
-            }
-            let payload = crate::statement_bytes(&Statement::new(pairs));
-            let token = crate::github::request_token(&crate::attest::audience_for(&payload)).await?;
-            let envelope = serde_json::to_vec(&Envelope::new(&payload, token)).map_err(|e| e.to_string())?;
-            let env_hash = sha256_hex(&envelope);
-            self.save_l1(&env_hash, &envelope, &entries).await?;
-            if self.l1.is_some() {
-                tracing::info!(results = entries.len(), batch = %env_hash, "first tier: saved new results");
-            }
-            // Keep the results servable from memory (and plannable) like
-            // first-tier ones.
-            for (a, r, _) in &entries {
-                lock(&self.indexed).insert(a.clone(), r.clone());
-            }
-            lock(&self.l1_envelopes).insert(env_hash.clone(), envelope);
-            if self.promote == Promote::All || self.l1.is_none() {
-                plan.push(Job { kind: JobKind::Push, envelope: env_hash, actions: entries.into_iter().map(|(a, _, _)| a).collect() });
-            }
+    /// Signs the results executed so far as one batch.
+    async fn sign_pending(&self) -> Result<usize, StoreError> {
+        let pending: Vec<Pending> = std::mem::take(&mut *self.pending());
+        if pending.is_empty() {
+            return Ok(0);
         }
-
-        // Registry results served via the slow path: index them.
-        for (env_hash, results) in std::mem::take(&mut *lock(&self.reindex)) {
-            plan.push(Job { kind: JobKind::Index, envelope: env_hash, actions: results.into_keys().collect() });
+        if self.writer.is_none() && self.l1.is_none() {
+            return Err(StoreError::Nowhere);
         }
-        if self.promote != Promote::None {
-            // First-tier results reused this run, under their own envelopes,
-            // unless a registry index already holds them.
-            let reused: Vec<String> = std::mem::take(&mut *lock(&self.reused)).into_iter().collect();
-            let registry = lock(&self.registry_origin).clone();
-            let skipped = reused.iter().filter(|a| registry.contains_key(*a)).count();
-            if skipped > 0 {
-                tracing::info!(results = skipped, "reused results already in a registry index: not promoted");
-            }
-            let mut by_env: HashMap<String, Vec<String>> = HashMap::new();
-            for a in reused.into_iter().filter(|a| !registry.contains_key(a)) {
-                if let Some(env) = lock(&self.l1_origin).get(&a).cloned() {
-                    by_env.entry(env).or_default().push(a);
-                }
-            }
-            plan.extend(by_env.into_iter().map(|(envelope, actions)| Job { kind: JobKind::Push, envelope, actions }));
-        }
-
-        // Write registry results served this run through to the first tier,
-        // under their own envelopes, so the next run needs no registry reads.
-        if self.l1.is_some() {
-            let served: Vec<String> = std::mem::take(&mut *lock(&self.served_remote)).into_iter().collect();
-            let mut by_env: HashMap<String, Vec<String>> = HashMap::new();
-            for a in served {
-                if let Some(env) = lock(&self.registry_origin).get(&a).cloned() {
-                    by_env.entry(env).or_default().push(a);
-                }
-            }
-            let (mut batches, mut results) = (0, 0);
-            for (env_hash, actions) in by_env {
-                let Some(envelope) = self.local.get_blob(&env_hash).await else { continue };
-                let entries = self.entries(&actions).await?;
-                self.save_l1(&env_hash, &envelope, &entries).await?;
-                batches += 1;
-                results += entries.len();
-            }
-            if results > 0 {
-                tracing::info!(results, batches, "first tier: wrote through registry results");
-            }
-        }
-
-        match &self.l1 {
-            Some(l1) if !plan.is_empty() => {
-                let n: usize = plan.iter().map(|j| j.actions.len()).sum();
-                l1.write_outbox(&serde_json::to_vec(&plan).map_err(|e| e.to_string())?).await?;
-                tracing::info!(jobs = plan.len(), results = n, "registry promotion queued in the first-tier outbox");
-            }
-            Some(_) => {}
-            None => self.run_plan(merge(plan)).await?,
+        let pairs = pending.iter().map(|p| Pair {
+            action: p.action.into(),
+            result: Digest::of(&p.result.encode_to_vec()),
+        });
+        let envelope = Bytes::from(
+            crate::attest::sign(Batch::new(pairs).to_bytes())
+                .await?
+                .to_bytes(),
+        );
+        let id = BatchId(Sha256::of(&envelope));
+        let mut results = Vec::with_capacity(pending.len());
+        for p in pending {
+            let blobs = self.referenced_blobs(&p.result).await?;
+            results.push(CachedResult {
+                action: p.action.id,
+                result: p.result,
+                blobs,
+            });
         }
         if let Some(l1) = &self.l1 {
-            l1.prune(L1_MAX_BATCHES, &self.jwks, &self.keyring).await?;
+            self.save_first_tier(l1, id, envelope.clone(), &results)
+                .await?;
         }
-        Ok(pending.len())
+        let n = results.len();
+        self.envelopes.insert(id, envelope);
+        for r in results {
+            self.known.insert(
+                r.action,
+                Known {
+                    result: r,
+                    batch: id,
+                    in_first_tier: self.l1.is_some(),
+                    in_registry: InRegistry::No,
+                    built_here: true,
+                    used: false,
+                },
+            );
+        }
+        tracing::info!(results = n, batch = %id, "signed new results");
+        Ok(n)
     }
 
-    /// Pushes every plan in the first-tier outbox to the registry (merged, so
-    /// repeated plans cost nothing extra), removing each once done. Needs a
-    /// writer; call `load_l1` first.
-    pub async fn drain_outbox(&self) -> Result<usize, String> {
-        let Some(l1) = &self.l1 else { return Ok(0) };
-        let mut jobs = Vec::new();
-        let mut files = Vec::new();
-        for (path, bytes) in l1.outbox().await {
-            match serde_json::from_slice::<Vec<Job>>(&bytes) {
-                Ok(j) => jobs.extend(j),
-                Err(e) => tracing::warn!(path = %path.display(), error = %e, "unreadable outbox plan: dropped"),
+    /// Plans registry writes per policy and marks them as planned, so a
+    /// later publish does not plan them again.
+    fn plan(&self) -> Plan {
+        let mut plan = Plan::default();
+        let mut skipped = 0;
+        for mut k in self.known.iter_mut() {
+            let push = match (self.promote, k.in_registry) {
+                (_, InRegistry::Indexed | InRegistry::ManifestOnly) => {
+                    skipped += usize::from(k.used && k.in_first_tier && !k.built_here);
+                    false
+                }
+                (_, InRegistry::No) if self.l1.is_none() => k.built_here,
+                (Promote::All, InRegistry::No) => k.built_here || (k.used && k.in_first_tier),
+                (Promote::Reused, InRegistry::No) => k.used && k.in_first_tier && !k.built_here,
+                (Promote::None, InRegistry::No) => false,
+            };
+            if push {
+                plan.push.entry(k.batch).or_default().insert(*k.key());
+                k.in_registry = InRegistry::Indexed;
+            } else if k.used && k.in_registry == InRegistry::ManifestOnly {
+                plan.index.entry(k.batch).or_default().insert(*k.key());
+                k.in_registry = InRegistry::Indexed;
             }
-            files.push(path);
         }
-        let jobs = merge(jobs);
-        let n = jobs.iter().map(|j| j.actions.len()).sum();
-        self.run_plan(jobs).await?;
-        for f in files {
-            let _ = tokio::fs::remove_file(f).await;
+        if skipped > 0 {
+            tracing::info!(
+                results = skipped,
+                "reused results already in a registry: not promoted"
+            );
+        }
+        plan
+    }
+
+    /// Writes registry results served this run through to the first tier,
+    /// under their own envelopes, so the next run needs no registry reads.
+    async fn write_through(&self, l1: &L1) -> Result<(), StoreError> {
+        let mut by_batch: BTreeMap<BatchId, Vec<ActionId>> = BTreeMap::new();
+        for k in self.known.iter().filter(|k| k.used && !k.in_first_tier) {
+            by_batch.entry(k.batch).or_default().push(*k.key());
+        }
+        let mut written = 0;
+        for (id, actions) in &by_batch {
+            let Some(envelope) = self.envelope(id).await else {
+                continue;
+            };
+            let results = self.results_of(actions);
+            self.save_first_tier(l1, *id, envelope, &results).await?;
+            written += results.len();
+            for a in actions {
+                if let Some(mut k) = self.known.get_mut(a) {
+                    k.in_first_tier = true;
+                }
+            }
+        }
+        if written > 0 {
+            tracing::info!(
+                results = written,
+                batches = by_batch.len(),
+                "first tier: wrote through registry results"
+            );
+        }
+        Ok(())
+    }
+
+    /// Signs new results, saves them to the first tier, and sends the
+    /// registry what policy says: queued in the first tier's outbox if there
+    /// is one, else written now. Returns the number of new results signed.
+    pub async fn publish(&self) -> Result<usize, StoreError> {
+        // Planning compares against the registry indexes.
+        self.load_registry().await;
+        let signed = self.sign_pending().await?;
+        let plan = self.plan();
+        match &self.l1 {
+            Some(l1) => {
+                self.write_through(l1).await?;
+                if !plan.is_empty() {
+                    l1.enqueue(&plan).await?;
+                    tracing::info!(
+                        results = plan.results(),
+                        "registry promotion queued in the first-tier outbox"
+                    );
+                }
+                let queued: HashSet<BatchId> = l1
+                    .queued::<Plan>()
+                    .await?
+                    .iter()
+                    .flat_map(|q| q.plan.batches().collect::<Vec<_>>())
+                    .collect();
+                l1.prune(L1_MAX_BATCHES, &queued, &self.jwks, &self.keyring)
+                    .await?;
+            }
+            None => self.run(plan).await?,
+        }
+        Ok(signed)
+    }
+
+    /// Pushes every plan queued in the first tier's outbox (merged, so
+    /// repeats cost nothing), removing each once done. Call
+    /// `load_first_tier` first: only verified results are sent.
+    pub async fn drain_outbox(&self) -> Result<usize, StoreError> {
+        let Some(l1) = &self.l1 else { return Ok(0) };
+        let mut queued = l1.queued::<Plan>().await?;
+        let plan = Plan::merge(queued.iter_mut().map(|q| std::mem::take(&mut q.plan)));
+        let n = plan.results();
+        self.run(plan).await?;
+        for q in queued {
+            l1.done(q).await?;
         }
         Ok(n)
     }
 
-    async fn entries(&self, actions: &[String]) -> Result<Vec<Entry>, String> {
-        let mut entries = Vec::new();
-        for a in actions {
-            let Some(r) = lock(&self.indexed).get(a).cloned() else { continue };
-            let blobs = self.referenced_blobs(&r).await?;
-            entries.push((a.clone(), r, blobs));
-        }
-        Ok(entries)
-    }
-
-    async fn envelope(&self, hash: &str) -> Option<Vec<u8>> {
-        if let Some(e) = lock(&self.l1_envelopes).get(hash).cloned() {
-            return Some(e);
-        }
-        self.local.get_blob(hash).await
-    }
-
-    /// Only results verified (or produced) in this process are sent: plans
-    /// name actions, never carry results, so a tampered outbox can at worst
-    /// re-send verified entries.
-    async fn run_plan(&self, plan: Vec<Job>) -> Result<(), String> {
-        let Some(writer) = &self.writer else { return Ok(()) };
-        for job in plan {
-            let Some(envelope) = self.envelope(&job.envelope).await else {
-                tracing::warn!(batch = %job.envelope, "envelope unavailable: not promoted");
-                continue;
-            };
-            let entries = self.entries(&job.actions).await?;
-            if entries.is_empty() {
-                continue;
-            }
-            match job.kind {
-                JobKind::Push => {
-                    self.push_batch(writer, &job.envelope, &envelope, &entries).await?;
-                    tracing::info!(results = entries.len(), batch = %job.envelope, "pushed to the registry");
+    async fn run(&self, plan: Plan) -> Result<(), StoreError> {
+        let Some(writer) = &self.writer else {
+            return Ok(());
+        };
+        let Plan { push, index } = Plan::merge([plan]);
+        for (jobs, pushing) in [(push, true), (index, false)] {
+            for (id, actions) in jobs {
+                let Some(envelope) = self.envelope(&id).await else {
+                    tracing::warn!(batch = %id, "envelope unavailable: skipped");
+                    continue;
+                };
+                let results = self.results_of(&actions);
+                if results.is_empty() {
+                    continue;
                 }
-                JobKind::Index => {
-                    let bundle = l1::bundle_bytes(&entries)?;
-                    let bundle_hash = writer.put_blob(&bundle).await?;
-                    self.append_index(writer, (&job.envelope, envelope.len()), (&bundle_hash, bundle.len())).await?;
-                    tracing::info!(results = entries.len(), batch = %job.envelope, "indexed previously signed results");
+                if pushing {
+                    self.push_batch(writer, id, envelope, &results).await?;
+                } else {
+                    self.index_batch(writer, id, envelope, &results).await?;
                 }
+                tracing::info!(results = results.len(), batch = %id, pushed = pushing, "registry updated");
             }
         }
         Ok(())
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum JobKind {
-    Push,
-    Index,
-}
-
-/// One registry write: a batch (by envelope) restricted to some actions.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Job {
-    kind: JobKind,
-    envelope: String,
-    actions: Vec<String>,
-}
-
-/// Unions plans by (kind, envelope). A pushed batch is indexed too, so an
-/// index job covered by a push of the same batch is dropped.
-fn merge(jobs: Vec<Job>) -> Vec<Job> {
-    let mut by: std::collections::BTreeMap<(JobKind, String), BTreeSet<String>> = Default::default();
-    for j in jobs {
-        by.entry((j.kind, j.envelope)).or_default().extend(j.actions);
-    }
-    let pushed: HashSet<String> = by.keys().filter(|(k, _)| *k == JobKind::Push).map(|(_, e)| e.clone()).collect();
-    by.into_iter()
-        .filter(|((k, e), _)| !(*k == JobKind::Index && pushed.contains(e)))
-        .map(|((kind, envelope), a)| Job { kind, envelope, actions: a.into_iter().collect() })
-        .collect()
-}
-
-impl GhcrStore {
-    fn indexed_result(&self, action: &str) -> Option<re::ActionResult> {
-        let r = lock(&self.indexed).get(action).cloned()?;
-        if lock(&self.l1_origin).contains_key(action) {
-            lock(&self.reused).insert(action.to_string());
-        } else if lock(&self.registry_origin).contains_key(action) {
-            lock(&self.served_remote).insert(action.to_string());
-        }
-        Some(r)
+    /// A known result, marked as used.
+    fn serve_known(&self, action: &ActionId) -> Option<re::ActionResult> {
+        let mut k = self.known.get_mut(action)?;
+        k.used = true;
+        Some(k.result.result.clone())
     }
 }
 
@@ -627,70 +757,96 @@ impl GhcrStore {
 impl Store for GhcrStore {
     /// Local, first tier, or referenced by a verified result (fetched on
     /// demand); anything else buck2 simply uploads.
-    async fn has_blob(&self, hash: &str) -> bool {
-        if self.local.has_blob(hash).await || lock(&self.known).contains(hash) {
+    async fn has_blob(&self, hash: &Sha256) -> bool {
+        if self.local.has_blob(hash).await || self.referenced.contains(hash) {
             return true;
         }
         match &self.l1 {
-            Some(l1) => l1.has_blob(hash).await,
+            Some(l1) => l1.blobs().contains(hash).await,
             None => false,
         }
     }
 
-    async fn get_blob(&self, hash: &str) -> Option<Vec<u8>> {
+    async fn get_blob(&self, hash: &Sha256) -> Option<Blob> {
         self.any_blob(hash).await
     }
 
-    async fn put_blob(&self, hash: &str, data: &[u8]) -> Result<(), String> {
-        self.local.put_blob(hash, data).await
+    async fn put_blob(&self, blob: &Blob) -> Result<(), StoreError> {
+        self.local.put_blob(blob).await
     }
 
-    async fn get_action_result(&self, action: &str) -> Option<re::ActionResult> {
+    async fn get_action_result(&self, action: &ActionId) -> Option<re::ActionResult> {
         // Results produced in this run are trusted; they get signed on publish.
         if let Some(r) = self.local.get_action_result(action).await {
             return Some(r);
         }
-        if let Some(r) = self.indexed_result(action) {
+        if let Some(r) = self.serve_known(action) {
             return Some(r);
         }
         // A first-tier miss: wait for the registry indexes (usually already
         // read in the background), then fall back to per-action lookup.
         self.load_registry().await;
-        if let Some(r) = self.indexed_result(action) {
+        if let Some(r) = self.serve_known(action) {
             return Some(r);
         }
         for reg in &self.readers {
-            if let Some(r) = self.lookup(reg, action).await {
+            if let Some(r) = self.lookup(reg, *action).await {
                 return Some(r);
             }
         }
         None
     }
 
-    async fn put_action_result(&self, action: &str, action_size: i64, result: &re::ActionResult) -> Result<(), String> {
-        self.local.put_action_result(action, action_size, result).await?;
-        lock(&self.pending).push((action.to_string(), action_size, result.clone()));
+    async fn put_action_result(
+        &self,
+        action: ActionDigest,
+        result: &re::ActionResult,
+    ) -> Result<(), StoreError> {
+        self.local.put_action_result(action, result).await?;
+        self.pending().push(Pending {
+            action,
+            result: result.clone(),
+        });
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod plan_tests {
+mod tests {
     use super::*;
 
-    fn job(kind: JobKind, env: &str, actions: &[&str]) -> Job {
-        Job { kind, envelope: env.into(), actions: actions.iter().map(|a| a.to_string()).collect() }
+    fn id(n: u8) -> Sha256 {
+        Sha256::of(&[n])
     }
 
     #[test]
-    fn merge_unions_by_batch_and_drops_index_jobs_covered_by_a_push() {
-        let m = merge(vec![
-            job(JobKind::Push, "e1", &["a", "b"]),
-            job(JobKind::Push, "e1", &["b", "c"]),
-            job(JobKind::Index, "e1", &["a"]),
-            job(JobKind::Index, "e2", &["x"]),
+    fn merge_unions_and_drops_indexing_covered_by_a_push() {
+        let (b1, b2) = (BatchId(id(1)), BatchId(id(2)));
+        let (a, b, c, x) = (
+            ActionId(id(10)),
+            ActionId(id(11)),
+            ActionId(id(12)),
+            ActionId(id(13)),
+        );
+        let p = |push: &[(BatchId, &[ActionId])], index: &[(BatchId, &[ActionId])]| Plan {
+            push: push
+                .iter()
+                .map(|(k, v)| (*k, v.iter().copied().collect()))
+                .collect(),
+            index: index
+                .iter()
+                .map(|(k, v)| (*k, v.iter().copied().collect()))
+                .collect(),
+        };
+        let merged = Plan::merge([
+            p(&[(b1, &[a, b])], &[(b1, &[a]), (b2, &[x])]),
+            p(&[(b1, &[b, c])], &[]),
         ]);
-        let got: Vec<_> = m.iter().map(|j| (j.kind, j.envelope.as_str(), j.actions.clone())).collect();
-        assert_eq!(got, vec![(JobKind::Push, "e1", vec!["a".into(), "b".into(), "c".into()]), (JobKind::Index, "e2", vec!["x".into()])]);
+        assert_eq!(merged, p(&[(b1, &[a, b, c])], &[(b2, &[x])]));
+        // Round-trips through the outbox format.
+        assert_eq!(
+            serde_json::from_slice::<Plan>(&serde_json::to_vec(&merged).unwrap()).unwrap(),
+            merged
+        );
     }
 }

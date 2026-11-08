@@ -5,146 +5,324 @@
 //! Actions OIDC token whose audience is `hartland-attest:sha256:<hex>` of the
 //! exact statement bytes, so GitHub's signature over the token covers the
 //! statement.
+//!
+//! Wire types (`Raw*`) are private; what callers get has been parsed: a
+//! `Batch` maps each action to its result, and a `Signed<T>` exists only
+//! once the envelope has verified against a keyring.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use crate::digest::{ActionId, Digest, Sha256};
+use crate::jwt::{self, Jwks};
+use crate::keyring::{Keyring, Signer, TrustError};
+use monostate::MustBe;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_with::base64::Base64;
+use serde_with::serde_as;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 
-pub const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
-pub const PREDICATE_TYPE: &str = "https://github.com/nhawkes/hartland/attest/action-results/v0";
 pub const ENVELOPE_MEDIA_TYPE: &str = "application/vnd.hartland.attestation.v0+json";
-pub const PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
-pub const AUDIENCE_PREFIX: &str = "hartland-attest:sha256:";
-pub const SIGNATURE_KIND: &str = "github-actions-oidc";
 
-/// A REAPI-style digest: lowercase hex sha256 and size in bytes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Digest {
-    pub hash: String,
-    pub size: u64,
+#[derive(Debug, thiserror::Error)]
+pub enum VerifyError {
+    #[error("envelope is not JSON of the expected shape: {0}")]
+    Envelope(serde_json::Error),
+    #[error("envelope has no signatures")]
+    Unsigned,
+    #[error("no signature verifies: {}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
+    NoValidSignature(Vec<SignatureError>),
+    #[error("signed payload is not a valid statement: {0}")]
+    Statement(serde_json::Error),
+    #[error("statement names {claimed} but the builder ran for {actual}")]
+    WrongRepository { claimed: String, actual: String },
+    #[error("statement names commit {claimed} but the builder ran on {actual:?}")]
+    WrongCommit {
+        claimed: crate::digest::GitSha,
+        actual: Option<crate::digest::GitSha>,
+    },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SignatureError {
+    #[error("unsupported signature kind")]
+    UnsupportedKind,
+    #[error(transparent)]
+    Jwt(#[from] jwt::JwtError),
+    #[error(transparent)]
+    Trust(#[from] TrustError),
+}
+
+/// The OIDC audience that binds a token to exact payload bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Audience(pub Sha256);
+
+impl Audience {
+    const PREFIX: &str = "hartland-attest:sha256:";
+
+    pub fn of(payload: &[u8]) -> Audience {
+        Audience(Sha256::of(payload))
+    }
+}
+
+impl fmt::Display for Audience {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", Audience::PREFIX, self.0)
+    }
+}
+
+impl FromStr for Audience {
+    type Err = crate::digest::ParseError;
+    fn from_str(s: &str) -> Result<Audience, Self::Err> {
+        let hex = s
+            .strip_prefix(Audience::PREFIX)
+            .ok_or_else(|| crate::digest::ParseError::Prefixed(s.to_string()))?;
+        Ok(Audience(hex.parse()?))
+    }
+}
+
+// ---- statements -----------------------------------------------------------
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActionResult {
+pub(crate) struct Subject {
+    pub name: String,
+    pub digest: SubjectDigest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SubjectDigest {
+    pub sha256: Sha256,
+}
+
+/// One signed fact: this action's result has this digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pair {
     pub action: Digest,
     pub result: Digest,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Predicate {
-    pub results: Vec<ActionResult>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Subject {
-    pub name: String,
-    pub digest: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Statement {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RawStatement {
     #[serde(rename = "_type")]
-    pub type_: String,
-    pub subject: Vec<Subject>,
+    type_: MustBe!("https://in-toto.io/Statement/v1"),
+    subject: Vec<Subject>,
     #[serde(rename = "predicateType")]
-    pub predicate_type: String,
-    pub predicate: Predicate,
+    predicate_type: MustBe!("https://github.com/nhawkes/hartland/attest/action-results/v0"),
+    predicate: RawPredicate,
 }
 
-impl Statement {
-    /// Builds a statement whose subjects are the action digests, so a lookup
-    /// by action digest finds the batch that vouches for it.
-    pub fn new(mut results: Vec<ActionResult>) -> Statement {
-        results.sort_by(|a, b| a.action.hash.cmp(&b.action.hash));
-        let subject = results
-            .iter()
-            .map(|r| Subject {
-                name: "action".to_string(),
-                digest: [("sha256".to_string(), r.action.hash.clone())].into(),
-            })
-            .collect();
-        Statement {
-            type_: STATEMENT_TYPE.to_string(),
-            subject,
-            predicate_type: PREDICATE_TYPE.to_string(),
-            predicate: Predicate { results },
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RawPredicate {
+    results: Vec<Pair>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BatchError {
+    #[error("subjects do not match results")]
+    SubjectMismatch,
+    #[error("action {0} listed twice")]
+    Duplicate(ActionId),
+}
+
+/// A batch statement: each action's signed result digest. Subjects are the
+/// action digests, so a lookup by action finds the batch that vouches for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawStatement", into = "RawStatement")]
+pub struct Batch {
+    pub results: BTreeMap<ActionId, Vouched>,
+}
+
+/// What a batch says about one action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vouched {
+    pub action_size: u64,
+    pub result: Digest,
+}
+
+impl Batch {
+    pub fn new(pairs: impl IntoIterator<Item = Pair>) -> Batch {
+        Batch {
+            results: pairs
+                .into_iter()
+                .map(|p| {
+                    (
+                        ActionId(p.action.hash),
+                        Vouched {
+                            action_size: p.action.size,
+                            result: p.result,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
-    pub fn check(&self) -> Result<(), String> {
-        if self.type_ != STATEMENT_TYPE {
-            return Err(format!("unexpected statement type {}", self.type_));
+    /// The exact bytes that get signed.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("a batch serialises")
+    }
+
+    /// Is `result` (serialised) what this batch signed for `action`?
+    pub fn vouches(&self, action: &ActionId, result: &[u8]) -> bool {
+        self.results
+            .get(action)
+            .is_some_and(|s| s.result.matches(result))
+    }
+}
+
+impl TryFrom<RawStatement> for Batch {
+    type Error = BatchError;
+    fn try_from(raw: RawStatement) -> Result<Batch, BatchError> {
+        if raw.subject.len() != raw.predicate.results.len() {
+            return Err(BatchError::SubjectMismatch);
         }
-        if self.predicate_type != PREDICATE_TYPE {
-            return Err(format!("unexpected predicate type {}", self.predicate_type));
-        }
-        if self.subject.len() != self.predicate.results.len() {
-            return Err("subjects do not match results".to_string());
-        }
-        for (s, r) in self.subject.iter().zip(&self.predicate.results) {
-            check_hex(&r.action.hash)?;
-            check_hex(&r.result.hash)?;
-            if s.digest.get("sha256") != Some(&r.action.hash) {
-                return Err(format!("subject does not match action {}", r.action.hash));
+        let mut results = BTreeMap::new();
+        for (s, p) in raw.subject.iter().zip(&raw.predicate.results) {
+            if s.digest.sha256 != p.action.hash {
+                return Err(BatchError::SubjectMismatch);
+            }
+            let action = ActionId(p.action.hash);
+            if results
+                .insert(
+                    action,
+                    Vouched {
+                        action_size: p.action.size,
+                        result: p.result,
+                    },
+                )
+                .is_some()
+            {
+                return Err(BatchError::Duplicate(action));
             }
         }
-        Ok(())
+        Ok(Batch { results })
     }
 }
 
-pub fn check_hex(h: &str) -> Result<(), String> {
-    if h.len() == 64 && h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
-        Ok(())
-    } else {
-        Err(format!("not a lowercase sha256 hex digest: {h}"))
+impl From<Batch> for RawStatement {
+    fn from(b: Batch) -> RawStatement {
+        // BTreeMap order: sorted by action digest, as signed.
+        let results: Vec<Pair> = b
+            .results
+            .iter()
+            .map(|(a, s)| Pair {
+                action: Digest {
+                    hash: a.0,
+                    size: s.action_size,
+                },
+                result: s.result,
+            })
+            .collect();
+        RawStatement {
+            type_: MustBe!("https://in-toto.io/Statement/v1"),
+            subject: results
+                .iter()
+                .map(|p| Subject {
+                    name: "action".to_string(),
+                    digest: SubjectDigest {
+                        sha256: p.action.hash,
+                    },
+                })
+                .collect(),
+            predicate_type: MustBe!("https://github.com/nhawkes/hartland/attest/action-results/v0"),
+            predicate: RawPredicate { results },
+        }
     }
 }
 
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let d = ring::digest::digest(&ring::digest::SHA256, bytes);
-    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-}
+// ---- envelopes ------------------------------------------------------------
 
-/// The OIDC audience that binds a token to these exact bytes.
-pub fn audience_for(payload: &[u8]) -> String {
-    format!("{AUDIENCE_PREFIX}{}", sha256_hex(payload))
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SignatureKind {
+    GithubActionsOidc,
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
-    pub kind: String,
+    pub kind: SignatureKind,
     /// The GitHub Actions OIDC token (a JWT).
     pub token: String,
 }
 
-/// The stored, signed form. `payload` is the exact statement bytes, base64.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The stored, signed form. `payload` is the exact statement bytes.
+#[serde_as]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Envelope {
     #[serde(rename = "mediaType")]
-    pub media_type: String,
+    media_type: MustBe!("application/vnd.hartland.attestation.v0+json"),
     #[serde(rename = "payloadType")]
-    pub payload_type: String,
-    pub payload: String,
-    pub signatures: Vec<Signature>,
+    payload_type: MustBe!("application/vnd.in-toto+json"),
+    #[serde_as(as = "Base64")]
+    payload: Vec<u8>,
+    signatures: Vec<Signature>,
+}
+
+/// A statement whose envelope verified, and who signed it.
+#[derive(Clone, Debug)]
+pub struct Signed<T> {
+    pub statement: T,
+    pub signer: Signer,
 }
 
 impl Envelope {
-    pub fn new(payload: &[u8], token: String) -> Envelope {
+    pub fn new(payload: Vec<u8>, token: String) -> Envelope {
         Envelope {
-            media_type: ENVELOPE_MEDIA_TYPE.to_string(),
-            payload_type: PAYLOAD_TYPE.to_string(),
-            payload: STANDARD.encode(payload),
-            signatures: vec![Signature { kind: SIGNATURE_KIND.to_string(), token }],
+            media_type: MustBe!("application/vnd.hartland.attestation.v0+json"),
+            payload_type: MustBe!("application/vnd.in-toto+json"),
+            payload,
+            signatures: vec![Signature {
+                kind: SignatureKind::GithubActionsOidc,
+                token,
+            }],
         }
     }
 
-    pub fn payload_bytes(&self) -> Result<Vec<u8>, String> {
-        if self.media_type != ENVELOPE_MEDIA_TYPE {
-            return Err(format!("unexpected envelope media type {}", self.media_type));
-        }
-        if self.payload_type != PAYLOAD_TYPE {
-            return Err(format!("unexpected payload type {}", self.payload_type));
-        }
-        STANDARD.decode(&self.payload).map_err(|e| format!("bad payload encoding: {e}"))
+    pub fn parse(bytes: &[u8]) -> Result<Envelope, VerifyError> {
+        serde_json::from_slice(bytes).map_err(VerifyError::Envelope)
     }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("an envelope serialises")
+    }
+
+    /// Some signature must be a GitHub Actions token, valid against the key
+    /// archive, bound to these exact payload bytes, and from a builder the
+    /// keyring trusts; then the payload must parse as `T`.
+    pub fn verify<T: DeserializeOwned>(
+        &self,
+        jwks: &Jwks,
+        keyring: &Keyring,
+    ) -> Result<Signed<T>, VerifyError> {
+        if self.signatures.is_empty() {
+            return Err(VerifyError::Unsigned);
+        }
+        let audience = Audience::of(&self.payload);
+        let mut errors = Vec::new();
+        for sig in &self.signatures {
+            let checked = match sig.kind {
+                SignatureKind::GithubActionsOidc => jwt::verify(&sig.token, jwks)
+                    .map_err(SignatureError::from)
+                    .and_then(|c| keyring.accept(&c, &audience).map_err(SignatureError::from)),
+                SignatureKind::Unsupported => Err(SignatureError::UnsupportedKind),
+            };
+            match checked {
+                Ok(signer) => {
+                    let statement =
+                        serde_json::from_slice(&self.payload).map_err(VerifyError::Statement)?;
+                    return Ok(Signed { statement, signer });
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        Err(VerifyError::NoValidSignature(errors))
+    }
+}
+
+/// Signs `payload` with a token minted for its audience (in Actions only).
+pub async fn sign(payload: Vec<u8>) -> Result<Envelope, crate::github::TokenError> {
+    let token = crate::github::request_token(&Audience::of(&payload)).await?;
+    Ok(Envelope::new(payload, token))
 }

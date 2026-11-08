@@ -13,32 +13,106 @@
 //! Ubuntu 24.04 runners block unprivileged user namespaces via AppArmor;
 //! `setup` lifts that (the runner user has sudo) and creates the uid.
 
-use std::path::{Path, PathBuf};
+use serde_with::{DeserializeFromStr, SerializeDisplay};
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::str::FromStr;
 use tokio::process::Command;
 
 pub const SANDBOX_USER: &str = "hlsandbox";
 pub const WORKDIR: &str = "/work";
 
+#[derive(Debug, thiserror::Error)]
+pub enum SandboxError {
+    #[error("{command}: {source}")]
+    Spawn {
+        command: String,
+        source: std::io::Error,
+    },
+    #[error("{command} failed: {stderr}")]
+    Failed { command: String, stderr: String },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Path(#[from] BadPath),
+    #[error("empty argv")]
+    EmptyArgv,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("not a normal relative path: {0:?}")]
+pub struct BadPath(String);
+
+/// A non-empty relative path of normal components only: no `..`, no root,
+/// no `.`. Safe to join onto a directory we control.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, SerializeDisplay, DeserializeFromStr,
+)]
+pub struct RelPath(PathBuf);
+
+impl FromStr for RelPath {
+    type Err = BadPath;
+    fn from_str(s: &str) -> Result<RelPath, BadPath> {
+        let p = Path::new(s.trim_end_matches('/'));
+        let normal = p.components().next().is_some()
+            && p.components().all(|c| matches!(c, Component::Normal(_)));
+        if normal {
+            Ok(RelPath(p.to_path_buf()))
+        } else {
+            Err(BadPath(s.to_string()))
+        }
+    }
+}
+
+impl fmt::Display for RelPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.display().fmt(f)
+    }
+}
+
+impl AsRef<Path> for RelPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl RelPath {
+    /// Every proper ancestor, outermost first (`a/b/c` gives `a`, `a/b`).
+    pub fn ancestors(&self) -> impl Iterator<Item = RelPath> + '_ {
+        let mut v: Vec<RelPath> = self
+            .0
+            .ancestors()
+            .skip(1)
+            .filter(|a| !a.as_os_str().is_empty())
+            .map(|a| RelPath(a.to_path_buf()))
+            .collect();
+        v.reverse();
+        v.into_iter()
+    }
+
+    pub fn join(&self, other: &RelPath) -> RelPath {
+        RelPath(self.0.join(&other.0))
+    }
+}
+
 pub struct Spec<'a> {
-    /// Directory whose contents become the action's working root.
+    /// Directory whose contents become the action's working root. Used in
+    /// place: the action may change it, and outputs are moved out of it into
+    /// `collect` (which must be on the same filesystem).
     pub input: &'a Path,
     /// argv[0] is resolved inside the sandbox, e.g. `/work/bin/sh`.
     pub argv: &'a [String],
     pub env: &'a [(String, String)],
-    /// Working directory relative to the input root ("" for the root).
-    pub workdir: &'a str,
+    pub workdir: Option<&'a RelPath>,
     /// Output paths relative to the working directory.
-    pub outputs: &'a [String],
+    pub outputs: &'a [RelPath],
     /// Where collected outputs are copied, at the same relative paths.
     pub collect: &'a Path,
     /// Run as `SANDBOX_USER` via sudo. False only for local development.
     pub drop_user: bool,
-    /// `input` is a private directory the caller will discard: use it as the
-    /// scratch directory in place instead of copying it.
-    pub take_input: bool,
     /// (host directory, path under the working root) mounted read-only.
-    pub ro_binds: &'a [(PathBuf, String)],
+    pub ro_binds: &'a [(PathBuf, RelPath)],
 }
 
 pub struct Outcome {
@@ -46,19 +120,26 @@ pub struct Outcome {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     /// Declared outputs that the action did not produce.
-    pub missing: Vec<String>,
+    pub missing: Vec<RelPath>,
 }
 
-async fn run(cmd: &mut Command) -> Result<(), String> {
-    let out = cmd.output().await.map_err(|e| format!("{cmd:?}: {e}"))?;
+async fn run(cmd: &mut Command) -> Result<(), SandboxError> {
+    let command = format!("{:?}", cmd.as_std());
+    let out = cmd.output().await.map_err(|source| SandboxError::Spawn {
+        command: command.clone(),
+        source,
+    })?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!("{cmd:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
+        Err(SandboxError::Failed {
+            command,
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        })
     }
 }
 
-async fn sudo(args: &[&str]) -> Result<(), String> {
+async fn sudo(args: &[&str]) -> Result<(), SandboxError> {
     run(Command::new("sudo").arg("-n").args(args)).await
 }
 
@@ -71,64 +152,62 @@ async fn succeeds(cmd: &mut Command) -> bool {
 /// bubblewrap is not on the GitHub runner image, so it comes from Ubuntu's
 /// archive here. That widens the trust base to Ubuntu's mirror; replace with a
 /// pinned static build from our own toolchain.
-pub async fn setup() -> Result<(), String> {
+pub async fn setup() -> Result<(), SandboxError> {
     if !succeeds(Command::new("bwrap").arg("--version")).await {
         sudo(&["apt-get", "install", "-qy", "bubblewrap"]).await?;
     }
-    sudo(&["sysctl", "-q", "kernel.apparmor_restrict_unprivileged_userns=0"]).await?;
-    if !succeeds(Command::new("id").arg(SANDBOX_USER)).await {
-        sudo(&["useradd", "--no-create-home", "--shell", "/usr/sbin/nologin", SANDBOX_USER]).await?;
+    sudo(&[
+        "sysctl",
+        "-q",
+        "kernel.apparmor_restrict_unprivileged_userns=0",
+    ])
+    .await?;
+    if nix::unistd::User::from_name(SANDBOX_USER)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        sudo(&[
+            "useradd",
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            SANDBOX_USER,
+        ])
+        .await?;
     }
     Ok(())
 }
 
-fn check_relative(p: &str) -> Result<(), String> {
-    let path = Path::new(p);
-    if path.is_absolute() || path.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
-        return Err(format!("output path must be relative and normal: {p}"));
-    }
-    Ok(())
-}
-
-pub async fn exec(spec: &Spec<'_>) -> Result<Outcome, String> {
-    for o in spec.outputs {
-        check_relative(o)?;
-    }
-    if !spec.workdir.is_empty() {
-        check_relative(spec.workdir)?;
-    }
+pub async fn exec(spec: &Spec<'_>) -> Result<Outcome, SandboxError> {
     if spec.argv.is_empty() {
-        return Err("empty argv".to_string());
+        return Err(SandboxError::EmptyArgv);
     }
-    let scratch = if spec.take_input { spec.input.to_path_buf() } else { make_scratch(&std::env::temp_dir()).await? };
-    let result = exec_in(spec, &scratch).await;
-    // Always reclaim and delete the scratch directory.
-    if spec.drop_user {
-        let _ = sudo(&["rm", "-rf", &scratch.display().to_string()]).await;
-    } else {
-        let _ = tokio::fs::remove_dir_all(&scratch).await;
+    let result = exec_in(spec).await;
+    if result.is_err() && spec.drop_user {
+        // Leave nothing the caller cannot delete.
+        let _ = reclaim(spec.input).await;
     }
     result
 }
 
-async fn make_scratch(base: &Path) -> Result<PathBuf, String> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let p = base.join(format!("hartland-action-{}-{n}", std::process::id()));
-    tokio::fs::create_dir(&p).await.map_err(|e| format!("{}: {e}", p.display()))?;
-    Ok(p)
+/// Gives the tree back to us after the sandbox uid owned it.
+async fn reclaim(dir: &Path) -> Result<(), SandboxError> {
+    let me = format!("{}:{}", nix::unistd::getuid(), nix::unistd::getgid());
+    sudo(&["chown", "-R", &me, &dir.display().to_string()]).await
 }
 
-async fn exec_in(spec: &Spec<'_>, scratch: &Path) -> Result<Outcome, String> {
-    let s = scratch.display().to_string();
-    if !spec.take_input {
-        // cp -a keeps modes and symlinks; the tree is ours (worker-owned).
-        run(Command::new("cp").arg("-a").arg(format!("{}/.", spec.input.display())).arg(scratch)).await?;
-    }
+async fn exec_in(spec: &Spec<'_>) -> Result<Outcome, SandboxError> {
+    let scratch = spec.input.display().to_string();
     if spec.drop_user {
-        sudo(&["chown", "-R", &format!("{SANDBOX_USER}:{SANDBOX_USER}"), &s]).await?;
+        sudo(&[
+            "chown",
+            "-R",
+            &format!("{SANDBOX_USER}:{SANDBOX_USER}"),
+            &scratch,
+        ])
+        .await?;
     }
-
     let mut cmd = if spec.drop_user {
         let mut c = Command::new("sudo");
         c.args(["-n", "-u", SANDBOX_USER, "--", "env", "-i", "bwrap"]);
@@ -136,44 +215,79 @@ async fn exec_in(spec: &Spec<'_>, scratch: &Path) -> Result<Outcome, String> {
     } else {
         Command::new("bwrap")
     };
-    cmd.args(["--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL"])
-        .args(["--tmpfs", "/", "--bind", &s, WORKDIR, "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+    cmd.args([
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--cap-drop",
+        "ALL",
+    ])
+    .args([
+        "--tmpfs", "/", "--bind", &scratch, WORKDIR, "--proc", "/proc", "--dev", "/dev", "--tmpfs",
+        "/tmp",
+    ]);
+    let work = Path::new(WORKDIR);
     for (host, rel) in spec.ro_binds {
-        cmd.arg("--ro-bind").arg(host).arg(format!("{WORKDIR}/{rel}"));
+        cmd.arg("--ro-bind").arg(host).arg(work.join(rel));
     }
-    let chdir = format!("{WORKDIR}/{}", spec.workdir).trim_end_matches('/').to_string();
-    cmd.args(["--chdir", &chdir, "--clearenv"]);
+    cmd.arg("--chdir")
+        .arg(spec.workdir.map_or(work.to_path_buf(), |w| work.join(w)))
+        .arg("--clearenv");
     for (k, v) in spec.env {
         cmd.args(["--setenv", k, v]);
     }
-    cmd.arg("--").args(spec.argv).stdin(Stdio::null()).kill_on_drop(true);
-    let out = cmd.output().await.map_err(|e| format!("cannot start sandbox: {e}"))?;
+    cmd.arg("--")
+        .args(spec.argv)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let out = cmd.output().await.map_err(|source| SandboxError::Spawn {
+        command: "bwrap".to_string(),
+        source,
+    })?;
 
     if spec.drop_user {
-        let me = format!("{}:{}", id("-u").await, id("-g").await);
-        sudo(&["chown", "-R", &me, &s]).await?;
+        reclaim(spec.input).await?;
     }
+    let root = spec
+        .workdir
+        .map_or(spec.input.to_path_buf(), |w| spec.input.join(w));
     let mut missing = Vec::new();
     for o in spec.outputs {
-        let src = scratch.join(spec.workdir).join(o);
+        let src = root.join(o);
         // symlink_metadata: never follow a link the action planted.
-        match tokio::fs::symlink_metadata(&src).await {
-            Ok(_) => {
-                let dst = spec.collect.join(o);
-                if let Some(parent) = dst.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|e| format!("{}: {e}", parent.display()))?;
-                }
-                run(Command::new("cp").arg("-a").arg(&src).arg(&dst)).await?;
-            }
-            Err(_) => missing.push(o.clone()),
+        if tokio::fs::symlink_metadata(&src).await.is_err() {
+            missing.push(o.clone());
+            continue;
         }
+        let dst = spec.collect.join(o);
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::rename(&src, &dst).await?;
     }
-    Ok(Outcome { exit_code: out.status.code().unwrap_or(-1), stdout: out.stdout, stderr: out.stderr, missing })
+    Ok(Outcome {
+        exit_code: out.status.code().unwrap_or(-1),
+        stdout: out.stdout,
+        stderr: out.stderr,
+        missing,
+    })
 }
 
-async fn id(flag: &str) -> String {
-    match Command::new("id").arg(flag).output().await {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        Err(_) => String::new(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_paths() {
+        assert!("a/b".parse::<RelPath>().is_ok());
+        assert!("a/b/".parse::<RelPath>().is_ok());
+        for bad in ["", "/a", "../a", "a/../b", "./a"] {
+            assert!(bad.parse::<RelPath>().is_err(), "{bad}");
+        }
+        let p: RelPath = "a/b/c".parse().unwrap();
+        assert_eq!(
+            p.ancestors().map(|a| a.to_string()).collect::<Vec<_>>(),
+            ["a", "a/b"]
+        );
     }
 }

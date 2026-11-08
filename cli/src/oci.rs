@@ -1,170 +1,285 @@
 //! A minimal async OCI distribution client, enough to use a registry (GHCR) as
-//! a content-addressed store: blobs by sha256, manifests by tag or digest, and
-//! the OCI 1.1 referrers query.
+//! a content-addressed store: blobs by sha256, manifests by tag or digest.
+//!
+//! No pacing on our side: requests go as fast as callers send them. When the
+//! registry answers 429 it says how long to wait (GHCR: "retry-after: 17ms"
+//! in the body, allowed 2000/minute). The first request to see it takes the
+//! gate, sleeps exactly that, and resends while still holding it; the gate
+//! reopens only when a reply comes back that is not a 429. Every request
+//! passes the gate before sending, so nothing else goes out meanwhile, sleeps
+//! never overlap, and the queue is released by one clean probe rather than a
+//! herd. Requests whose 429 predates the reopening just go again.
 
-use crate::attest::sha256_hex;
+use crate::digest::Sha256;
+use bytes::Bytes;
+use oci_spec::image::ImageManifest;
+use reqwest::StatusCode;
+use reqwest::header::HeaderMap;
+use serde_with::{DeserializeFromStr, SerializeDisplay};
+use std::fmt;
+use std::future::Future;
+use std::str::FromStr;
+use std::time::Duration;
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::Instant;
 
 pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
-pub const INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+const ATTEMPTS: u32 = 8;
 
-#[derive(Clone)]
-pub struct Registry {
-    host: String,
-    base: String,
-    repo: String,
-    bearer: Option<String>,
+#[derive(Debug, thiserror::Error)]
+pub enum OciError {
+    #[error("{op}: {status} {body}")]
+    Status {
+        op: &'static str,
+        status: StatusCode,
+        body: String,
+    },
+    #[error("giving up after {ATTEMPTS} attempts: {0}")]
+    GaveUp(String),
+    #[error("blob {0} failed its digest check")]
+    Corrupt(Sha256),
+    #[error("upload has no Location")]
+    NoLocation,
+    #[error("registry login answered without a token")]
+    NoToken,
+    #[error("manifest is not valid: {0}")]
+    Manifest(#[from] serde_json::Error),
 }
 
-pub struct Reply {
-    pub status: u16,
-    pub body: Vec<u8>,
-    pub headers: Vec<(String, String)>,
-}
+/// A tag: `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, SerializeDisplay, DeserializeFromStr,
+)]
+pub struct Tag(String);
 
-impl Reply {
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+#[derive(Debug, thiserror::Error)]
+#[error("not a valid OCI tag: {0:?}")]
+pub struct BadTag(String);
+
+impl FromStr for Tag {
+    type Err = BadTag;
+    fn from_str(s: &str) -> Result<Tag, BadTag> {
+        let ok = matches!(s.as_bytes(), [first, rest @ ..]
+            if (first.is_ascii_alphanumeric() || *first == b'_')
+                && rest.len() < 128
+                && rest.iter().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(c)));
+        if ok {
+            Ok(Tag(s.to_string()))
+        } else {
+            Err(BadTag(s.to_string()))
+        }
     }
 }
 
-const ATTEMPTS: u32 = 8;
-
-/// No pacing on our side: requests go as fast as callers send them. When the
-/// registry answers 429 it says how long to wait (GHCR: "retry-after: 17ms"
-/// in the body, allowed 2000/minute). The first request to see it takes this
-/// gate, sleeps exactly that, and resends while still holding it; the gate
-/// reopens only when a reply comes back that is not a 429. Every request
-/// passes the gate before sending, so nothing else goes out meanwhile, sleeps
-/// never overlap, and the queue is released by one clean probe rather than a
-/// herd. Requests whose 429 predates the reopening just go again.
-pub struct Gate {
-    /// When the gate last reopened after a clean probe.
-    reopened: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+impl fmt::Display for Tag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
-type Held = tokio::sync::MutexGuard<'static, Option<tokio::time::Instant>>;
+impl From<Sha256> for Tag {
+    /// A hex digest is a valid tag.
+    fn from(d: Sha256) -> Tag {
+        Tag(d.to_string())
+    }
+}
+
+/// What a manifest is fetched or stored by.
+#[derive(Clone, Debug)]
+pub enum Reference {
+    Tag(Tag),
+    Digest(Sha256),
+}
+
+impl fmt::Display for Reference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Reference::Tag(t) => t.fmt(f),
+            Reference::Digest(d) => write!(f, "sha256:{d}"),
+        }
+    }
+}
+
+pub struct Reply {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
+impl Reply {
+    fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body)
+            .chars()
+            .take(400)
+            .collect()
+    }
+
+    fn expect(self, op: &'static str, ok: StatusCode) -> Result<Reply, OciError> {
+        if self.status == ok {
+            Ok(self)
+        } else {
+            Err(OciError::Status {
+                op,
+                status: self.status,
+                body: self.body_text(),
+            })
+        }
+    }
+
+    /// How long a 429 asks us to wait: `Retry-After` seconds, or GHCR's
+    /// "retry-after: 17.76ms" in the body.
+    fn retry_after(&self) -> Option<Duration> {
+        if let Some(s) = self
+            .headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()?.trim().parse::<f64>().ok())
+        {
+            return Some(Duration::from_secs_f64(s));
+        }
+        let body = String::from_utf8_lossy(&self.body);
+        let rest = body.split("retry-after: ").nth(1)?;
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let n: f64 = rest[..end].parse().ok()?;
+        Some(Duration::from_secs_f64(if rest[end..].starts_with("ms") {
+            n / 1000.0
+        } else {
+            n
+        }))
+    }
+}
+
+/// A reply and when it arrived (the 429 wait counts from then).
+pub struct Received {
+    pub reply: Reply,
+    pub at: Instant,
+}
+
+/// The rate-limit gate; holds when it last reopened.
+pub struct Gate {
+    reopened: Mutex<Option<Instant>>,
+}
+
+impl Default for Gate {
+    fn default() -> Gate {
+        Gate::new()
+    }
+}
 
 impl Gate {
     pub const fn new() -> Gate {
-        Gate { reopened: tokio::sync::Mutex::const_new(None) }
+        Gate {
+            reopened: Mutex::const_new(None),
+        }
+    }
+
+    /// Sends with `send`, retrying 429 through the gate, 5xx and transport
+    /// errors with exponential backoff.
+    pub async fn send<F, Fut>(&'static self, send: F) -> Result<Reply, OciError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Received, reqwest::Error>>,
+    {
+        let mut last = String::new();
+        let mut held: Option<MutexGuard<'static, Option<Instant>>> = None;
+        for attempt in 0..ATTEMPTS {
+            if held.is_none() {
+                drop(self.reopened.lock().await);
+            }
+            let backoff = Duration::from_millis(100 << attempt.min(6));
+            match send().await {
+                Ok(Received { reply, at }) if reply.status == StatusCode::TOO_MANY_REQUESTS => {
+                    last = format!("429 {}", reply.body_text());
+                    let gate = match held.take() {
+                        Some(g) => g,
+                        None => self.reopened.lock().await,
+                    };
+                    if gate.is_some_and(|t| t > at) {
+                        continue; // another request's probe came back clean since
+                    }
+                    let wait = reply.retry_after().unwrap_or(backoff);
+                    tracing::debug!(?wait, attempt, "429: gate closed, backing off");
+                    tokio::time::sleep_until(at + wait).await;
+                    held = Some(gate); // probe while holding
+                }
+                Ok(Received { reply, .. }) => {
+                    if let Some(mut gate) = held.take() {
+                        tracing::debug!(status = %reply.status, "probe clean, gate reopened");
+                        *gate = Some(Instant::now());
+                    }
+                    if reply.status.is_server_error() {
+                        tracing::warn!(status = %reply.status, attempt, "server error, retrying");
+                        last = format!("{} {}", reply.status, reply.body_text());
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Ok(reply);
+                }
+                Err(e) => {
+                    // No reply: a held gate stays held for the next probe.
+                    tracing::warn!(error = %e, attempt, "transport error, retrying");
+                    last = e.to_string();
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+        if let Some(mut gate) = held {
+            *gate = Some(Instant::now());
+        }
+        Err(OciError::GaveUp(last))
     }
 }
 
 static GATE: Gate = Gate::new();
 
-/// A reply plus when it arrived; `Err` is a transport failure.
-type Sent = Result<(Reply, tokio::time::Instant), String>;
-
-/// Sends with `send`, retrying 429 through the gate, 5xx and transport errors
-/// with exponential backoff.
-async fn retrying<F, Fut>(gate: &'static Gate, send: F) -> Result<Reply, String>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Sent>,
-{
-    let mut last = String::new();
-    let mut held: Option<Held> = None;
-    let reopen = |held: &mut Option<Held>| {
-        if let Some(mut g) = held.take() {
-            *g = Some(tokio::time::Instant::now());
-        }
-    };
-    for attempt in 0..ATTEMPTS {
-        if held.is_none() {
-            drop(gate.reopened.lock().await);
-        }
-        let backoff = std::time::Duration::from_millis(100 << attempt.min(6));
-        match send().await {
-            Ok((r, received)) if r.status == 429 => {
-                last = format!("429 {}", String::from_utf8_lossy(&r.body));
-                let g = match held.take() {
-                    Some(g) => g,
-                    None => gate.reopened.lock().await,
-                };
-                if g.is_some_and(|t| t > received) {
-                    continue; // another request's probe came back clean since
-                }
-                let wait = retry_after(&r).unwrap_or(backoff);
-                tracing::debug!(?wait, attempt, "429: gate closed, backing off");
-                tokio::time::sleep_until(received + wait).await;
-                held = Some(g); // probe while holding
-            }
-            Ok((r, _)) => {
-                if held.is_some() {
-                    tracing::debug!(status = r.status, "probe clean, gate reopened");
-                }
-                reopen(&mut held);
-                if (500..600).contains(&r.status) {
-                    tracing::warn!(status = r.status, attempt, "server error, retrying");
-                    last = format!("{} {}", r.status, String::from_utf8_lossy(&r.body));
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                return Ok(r);
-            }
-            Err(e) => {
-                // No reply: a held gate stays held for the next probe.
-                tracing::warn!(error = %e, attempt, "transport error, retrying");
-                last = e;
-                tokio::time::sleep(backoff).await;
-            }
-        }
-    }
-    reopen(&mut held);
-    Err(format!("giving up after {ATTEMPTS} attempts: {last}"))
-}
-
-fn retry_after(r: &Reply) -> Option<std::time::Duration> {
-    if let Some(s) = r.header("Retry-After").and_then(|v| v.trim().parse::<f64>().ok()) {
-        return Some(std::time::Duration::from_secs_f64(s));
-    }
-    // GHCR puts it in the body: "retry-after: 17.76ms".
-    let body = String::from_utf8_lossy(&r.body);
-    let rest = body.split("retry-after: ").nth(1)?;
-    let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-    let n: f64 = num.parse().ok()?;
-    let unit = &rest[num.len()..];
-    Some(std::time::Duration::from_secs_f64(if unit.starts_with("ms") { n / 1000.0 } else { n }))
-}
-
 /// `make` builds a fresh request each try.
-async fn reply_with(make: impl Fn() -> reqwest::RequestBuilder) -> Result<Reply, String> {
-    retrying(&GATE, || async {
-        let resp = make().send().await.map_err(|e| e.to_string())?;
-        let received = tokio::time::Instant::now();
-        let status = resp.status().as_u16();
-        let headers = resp.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
-        let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
-        Ok((Reply { status, body, headers }, received))
+async fn send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<Reply, OciError> {
+    GATE.send(|| async {
+        let resp = make().send().await?;
+        let at = Instant::now();
+        let (status, headers) = (resp.status(), resp.headers().clone());
+        Ok(Received {
+            reply: Reply {
+                status,
+                headers,
+                body: resp.bytes().await?,
+            },
+            at,
+        })
     })
     .await
+}
+
+#[derive(Clone)]
+pub struct Registry {
+    host: String,
+    repo: String,
+    bearer: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct TokenReply {
+    #[serde(alias = "access_token")]
+    token: Option<String>,
 }
 
 impl Registry {
     /// `host` like `ghcr.io`, `repo` like `owner/hartland-cache`.
     pub fn new(host: &str, repo: &str) -> Registry {
-        Registry { host: host.to_string(), base: format!("https://{host}/v2/{repo}"), repo: repo.to_string(), bearer: None }
+        Registry {
+            host: host.to_string(),
+            repo: repo.to_string(),
+            bearer: None,
+        }
     }
 
-    /// Exchanges basic credentials (e.g. GITHUB_ACTOR + GITHUB_TOKEN) for a
-    /// registry bearer token scoped to pull and push on this repository.
-    pub async fn login(&mut self, user: &str, password: &str) -> Result<(), String> {
-        let url = format!("https://{}/token", self.host);
-        let scope = format!("repository:{}:pull,push", self.repo);
-        let r = reply_with(|| {
-            crate::http::client()
-                .get(&url)
-                .query(&[("service", self.host.as_str()), ("scope", scope.as_str())])
-                .basic_auth(user, Some(password))
-        })
-        .await?;
-        if r.status != 200 {
-            return Err(format!("registry login failed: {} {}", r.status, String::from_utf8_lossy(&r.body)));
-        }
-        let v: serde_json::Value = serde_json::from_slice(&r.body).map_err(|e| e.to_string())?;
-        let t = v.get("token").or_else(|| v.get("access_token")).and_then(|t| t.as_str()).ok_or("no token")?;
-        self.bearer = Some(t.to_string());
-        Ok(())
+    pub fn name(&self) -> String {
+        format!("{}/{}", self.host, self.repo)
+    }
+
+    fn url(&self, path: impl fmt::Display) -> String {
+        format!("https://{}/v2/{}/{path}", self.host, self.repo)
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -174,92 +289,121 @@ impl Registry {
         }
     }
 
-    pub async fn blob_exists(&self, hash: &str) -> Result<bool, String> {
-        let r = reply_with(|| self.auth(crate::http::client().head(format!("{}/blobs/sha256:{hash}", self.base)))).await?;
-        Ok(r.status == 200)
+    /// Exchanges basic credentials (e.g. GITHUB_ACTOR + GITHUB_TOKEN) for a
+    /// registry bearer token scoped to pull and push on this repository.
+    pub async fn login(&mut self, user: &str, password: &str) -> Result<(), OciError> {
+        let url = format!("https://{}/token", self.host);
+        let scope = format!("repository:{}:pull,push", self.repo);
+        let r = send(|| {
+            crate::http::client()
+                .get(&url)
+                .query(&[("service", self.host.as_str()), ("scope", scope.as_str())])
+                .basic_auth(user, Some(password))
+        })
+        .await?
+        .expect("registry login", StatusCode::OK)?;
+        let t: TokenReply = serde_json::from_slice(&r.body)?;
+        self.bearer = Some(t.token.ok_or(OciError::NoToken)?);
+        Ok(())
+    }
+
+    pub async fn blob_exists(&self, hash: &Sha256) -> Result<bool, OciError> {
+        let r = send(|| {
+            self.auth(crate::http::client().head(self.url(format_args!("blobs/sha256:{hash}"))))
+        })
+        .await?;
+        Ok(r.status == StatusCode::OK)
     }
 
     /// Reads a blob (following GHCR's redirect) and checks its digest.
-    pub async fn get_blob(&self, hash: &str) -> Result<Vec<u8>, String> {
-        let r = reply_with(|| self.auth(crate::http::client().get(format!("{}/blobs/sha256:{hash}", self.base)))).await?;
-        if r.status != 200 {
-            return Err(format!("get blob {hash}: {}", r.status));
+    /// `None` if the registry does not have it.
+    pub async fn get_blob(&self, hash: &Sha256) -> Result<Option<Bytes>, OciError> {
+        let r = send(|| {
+            self.auth(crate::http::client().get(self.url(format_args!("blobs/sha256:{hash}"))))
+        })
+        .await?;
+        if r.status == StatusCode::NOT_FOUND {
+            return Ok(None);
         }
-        if sha256_hex(&r.body) != hash {
-            return Err(format!("blob {hash} failed digest check"));
+        let r = r.expect("get blob", StatusCode::OK)?;
+        if Sha256::of(&r.body) != *hash {
+            return Err(OciError::Corrupt(*hash));
         }
-        Ok(r.body)
+        Ok(Some(r.body))
     }
 
-    /// The blob GET response itself, without following a redirect.
-    pub async fn get_blob_raw(&self, hash: &str) -> Result<Reply, String> {
-        reply_with(|| self.auth(crate::http::no_redirect_client().get(format!("{}/blobs/sha256:{hash}", self.base)))).await
-    }
-
-    /// Uploads a blob (monolithic POST then PUT) unless present. Returns its
-    /// sha256 hex.
-    pub async fn put_blob(&self, data: &[u8]) -> Result<String, String> {
-        let hash = sha256_hex(data);
+    /// Uploads a blob unless present. Single-request monolithic upload (POST
+    /// with digest and body); registries that do not support it answer 202
+    /// with a session, which a PUT then completes.
+    pub async fn put_blob(&self, data: Bytes) -> Result<Sha256, OciError> {
+        let hash = Sha256::of(&data);
         if self.blob_exists(&hash).await? {
             return Ok(hash);
         }
-        // Single-request monolithic upload (POST with digest and body): one
-        // request instead of two. Registries that do not support it answer
-        // 202 with a session, which we then complete with a PUT.
-        let r = reply_with(|| {
-            self.auth(crate::http::client().post(format!("{}/blobs/uploads/", self.base)))
+        let r = send(|| {
+            self.auth(crate::http::client().post(self.url("blobs/uploads/")))
                 .query(&[("digest", format!("sha256:{hash}"))])
-                .header("Content-Type", "application/octet-stream")
-                .body(data.to_vec())
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(data.clone())
         })
         .await?;
-        if r.status == 201 {
+        if r.status == StatusCode::CREATED {
             return Ok(hash);
         }
-        if r.status != 202 {
-            return Err(format!("start upload: {} {}", r.status, String::from_utf8_lossy(&r.body)));
-        }
-        let loc = r.header("Location").ok_or("upload has no Location")?.to_string();
-        let url = if loc.starts_with("http") { loc } else { format!("https://{}{loc}", self.host) };
+        let r = r.expect("start upload", StatusCode::ACCEPTED)?;
+        let loc = r
+            .headers
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or(OciError::NoLocation)?;
+        let url = if loc.starts_with("http") {
+            loc.to_string()
+        } else {
+            format!("https://{}{loc}", self.host)
+        };
         let sep = if url.contains('?') { '&' } else { '?' };
-        let r = reply_with(|| {
+        send(|| {
             self.auth(crate::http::client().put(format!("{url}{sep}digest=sha256:{hash}")))
-                .header("Content-Type", "application/octet-stream")
-                .body(data.to_vec())
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(data.clone())
         })
-        .await?;
-        if r.status != 201 {
-            return Err(format!("finish upload: {} {}", r.status, String::from_utf8_lossy(&r.body)));
-        }
+        .await?
+        .expect("finish upload", StatusCode::CREATED)?;
         Ok(hash)
     }
 
-    /// Puts a manifest under `reference` (a tag or `sha256:<hex>`). Returns
-    /// the manifest's digest as the registry reports it.
-    pub async fn put_manifest(&self, reference: &str, media_type: &str, body: &[u8]) -> Result<String, String> {
-        let r = reply_with(|| {
-            self.auth(crate::http::client().put(format!("{}/manifests/{reference}", self.base)))
-                .header("Content-Type", media_type)
-                .body(body.to_vec())
+    /// Stores a manifest under `reference`; returns its digest.
+    pub async fn put_manifest(
+        &self,
+        reference: &Reference,
+        manifest: &ImageManifest,
+    ) -> Result<Sha256, OciError> {
+        let body = Bytes::from(serde_json::to_vec(manifest)?);
+        send(|| {
+            self.auth(crate::http::client().put(self.url(format_args!("manifests/{reference}"))))
+                .header(reqwest::header::CONTENT_TYPE, MANIFEST_MEDIA_TYPE)
+                .body(body.clone())
+        })
+        .await?
+        .expect("put manifest", StatusCode::CREATED)?;
+        Ok(Sha256::of(&body))
+    }
+
+    /// `None` if there is no such manifest.
+    pub async fn get_manifest(
+        &self,
+        reference: &Reference,
+    ) -> Result<Option<ImageManifest>, OciError> {
+        let r = send(|| {
+            self.auth(crate::http::client().get(self.url(format_args!("manifests/{reference}"))))
+                .header(reqwest::header::ACCEPT, MANIFEST_MEDIA_TYPE)
         })
         .await?;
-        if r.status != 201 {
-            return Err(format!("put manifest {reference}: {} {}", r.status, String::from_utf8_lossy(&r.body)));
+        if r.status == StatusCode::NOT_FOUND {
+            return Ok(None);
         }
-        Ok(r.header("Docker-Content-Digest").map(str::to_string).unwrap_or_else(|| format!("sha256:{}", sha256_hex(body))))
-    }
-
-    pub async fn get_manifest(&self, reference: &str) -> Result<Reply, String> {
-        reply_with(|| {
-            self.auth(crate::http::client().get(format!("{}/manifests/{reference}", self.base)))
-                .header("Accept", format!("{MANIFEST_MEDIA_TYPE}, {INDEX_MEDIA_TYPE}"))
-        })
-        .await
-    }
-
-    /// OCI 1.1 referrers API. 404 means the registry does not support it.
-    pub async fn referrers(&self, digest: &str) -> Result<Reply, String> {
-        reply_with(|| self.auth(crate::http::client().get(format!("{}/referrers/{digest}", self.base)))).await
+        let r = r.expect("get manifest", StatusCode::OK)?;
+        Ok(Some(serde_json::from_slice(&r.body)?))
     }
 }
 
@@ -267,66 +411,111 @@ impl Registry {
 mod tests {
     use super::*;
 
-    fn reply(headers: Vec<(&str, &str)>, body: &str) -> Reply {
-        Reply { status: 429, body: body.as_bytes().to_vec(), headers: headers.into_iter().map(|(k, v)| (k.into(), v.into())).collect() }
+    fn reply(headers: &[(&'static str, &'static str)], body: &'static str) -> Reply {
+        let mut h = HeaderMap::new();
+        for (k, v) in headers {
+            h.insert(*k, v.parse().unwrap());
+        }
+        Reply {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            headers: h,
+            body: Bytes::from_static(body.as_bytes()),
+        }
     }
 
     #[test]
     fn retry_after_from_ghcr_body() {
-        let r = reply(vec![], r#"{"errors":[{"code":"TOOMANYREQUESTS","message":"retry-after: 17.763137ms, allowed: 2000/minute"}]}"#);
-        let d = retry_after(&r).unwrap();
-        assert!(d > std::time::Duration::from_millis(17) && d < std::time::Duration::from_millis(18));
+        let r = reply(
+            &[],
+            r#"{"errors":[{"code":"TOOMANYREQUESTS","message":"retry-after: 17.763137ms, allowed: 2000/minute"}]}"#,
+        );
+        let d = r.retry_after().unwrap();
+        assert!(d > Duration::from_millis(17) && d < Duration::from_millis(18));
+    }
+
+    #[test]
+    fn retry_after_from_header_seconds() {
+        assert_eq!(
+            reply(&[("retry-after", "2")], "").retry_after(),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(reply(&[], "nothing here").retry_after(), None);
+    }
+
+    #[test]
+    fn tags() {
+        assert!("hartland-index".parse::<Tag>().is_ok());
+        assert!(".hidden".parse::<Tag>().is_err());
+        assert!("a/b".parse::<Tag>().is_err());
+        assert!("x".repeat(129).parse::<Tag>().is_err());
     }
 
     /// A fake registry: 429 ("retry-after: 50ms") until `open_at`, then 200.
-    /// Records when each request was sent.
     struct Fake {
-        open_at: tokio::time::Instant,
-        sent: std::sync::Mutex<Vec<(tokio::time::Instant, u16)>>,
+        open_at: Instant,
+        sent: std::sync::Mutex<Vec<(Instant, StatusCode)>>,
     }
 
     impl Fake {
-        async fn send(&self) -> Sent {
-            let now = tokio::time::Instant::now();
-            let status = if now >= self.open_at { 200 } else { 429 };
+        async fn send(&self) -> Result<Received, reqwest::Error> {
+            let now = Instant::now();
+            let status = if now >= self.open_at {
+                StatusCode::OK
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
             self.sent.lock().unwrap().push((now, status));
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            Ok((Reply { status, body: b"retry-after: 50ms".to_vec(), headers: vec![] }, tokio::time::Instant::now()))
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            Ok(Received {
+                reply: Reply {
+                    status,
+                    headers: HeaderMap::new(),
+                    body: Bytes::from_static(b"retry-after: 50ms"),
+                },
+                at: Instant::now(),
+            })
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn one_probe_at_a_time_and_no_herd() {
         static G: Gate = Gate::new();
-        let start = tokio::time::Instant::now();
+        let start = Instant::now();
         // Rate-limited for 120 ms: needs three 50 ms back-offs to clear.
-        let fake = std::sync::Arc::new(Fake { open_at: start + std::time::Duration::from_millis(120), sent: Default::default() });
+        let fake = std::sync::Arc::new(Fake {
+            open_at: start + Duration::from_millis(120),
+            sent: Default::default(),
+        });
         let tasks: Vec<_> = (0..10)
             .map(|_| {
                 let f = fake.clone();
-                tokio::spawn(async move { retrying(&G, || f.send()).await })
+                tokio::spawn(async move { G.send(|| f.send()).await })
             })
             .collect();
         for t in tasks {
-            assert_eq!(t.await.unwrap().unwrap().status, 200);
+            assert_eq!(t.await.unwrap().unwrap().status, StatusCode::OK);
         }
         let sent = fake.sent.lock().unwrap().clone();
-        let first_ok = sent.iter().find(|(_, s)| *s == 200).unwrap().0;
+        let first_ok = sent.iter().find(|(_, s)| *s == StatusCode::OK).unwrap().0;
         let before: Vec<_> = sent.iter().filter(|(t, _)| *t < first_ok).collect();
         // The initial burst of 10, then one probe per back-off: no herd.
-        assert!(before.len() <= 10 + 3, "herd while rate-limited: {} requests before the first 200", before.len());
+        assert!(
+            before.len() <= 10 + 3,
+            "herd while rate-limited: {} requests before the first 200",
+            before.len()
+        );
         // Probes were spaced by the requested sleep: never overlapping.
         let probes: Vec<_> = before.iter().skip(10).map(|(t, _)| *t).collect();
         for w in probes.windows(2) {
-            assert!(w[1] - w[0] >= std::time::Duration::from_millis(50), "sleeps overlapped: {probes:?}");
+            assert!(
+                w[1] - w[0] >= Duration::from_millis(50),
+                "sleeps overlapped: {probes:?}"
+            );
         }
         // Nothing failed after the gate reopened.
-        assert!(sent.iter().all(|(t, s)| *t < first_ok || *s == 200));
-    }
-
-    #[test]
-    fn retry_after_from_header_seconds() {
-        assert_eq!(retry_after(&reply(vec![("Retry-After", "2")], "")), Some(std::time::Duration::from_secs(2)));
-        assert_eq!(retry_after(&reply(vec![], "nothing here")), None);
+        assert!(
+            sent.iter()
+                .all(|(t, s)| *t < first_ok || *s == StatusCode::OK)
+        );
     }
 }
