@@ -27,12 +27,65 @@ impl Reply {
     }
 }
 
-async fn reply(req: reqwest::RequestBuilder) -> Result<Reply, String> {
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let status = resp.status().as_u16();
-    let headers = resp.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
-    let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
-    Ok(Reply { status, body, headers })
+/// GHCR allows 2000 requests per minute (seen as 429 TOOMANYREQUESTS); stay
+/// under it process-wide.
+const REQUESTS_PER_SECOND: f64 = 30.0;
+const ATTEMPTS: u32 = 6;
+
+/// Spaces requests evenly: each caller takes the next slot and sleeps until it.
+async fn pace() {
+    static NEXT: std::sync::Mutex<Option<tokio::time::Instant>> = std::sync::Mutex::new(None);
+    let interval = std::time::Duration::from_secs_f64(1.0 / REQUESTS_PER_SECOND);
+    let slot = {
+        let mut next = NEXT.lock().unwrap_or_else(|p| p.into_inner());
+        let now = tokio::time::Instant::now();
+        let slot = next.map_or(now, |n| n.max(now));
+        *next = Some(slot + interval);
+        slot
+    };
+    tokio::time::sleep_until(slot).await;
+}
+
+fn retry_after(r: &Reply) -> Option<std::time::Duration> {
+    if let Some(s) = r.header("Retry-After").and_then(|v| v.trim().parse::<f64>().ok()) {
+        return Some(std::time::Duration::from_secs_f64(s));
+    }
+    // GHCR puts it in the body: "retry-after: 17.76ms".
+    let body = String::from_utf8_lossy(&r.body);
+    let rest = body.split("retry-after: ").nth(1)?;
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let n: f64 = num.parse().ok()?;
+    let unit = &rest[num.len()..];
+    Some(std::time::Duration::from_secs_f64(if unit.starts_with("ms") { n / 1000.0 } else { n }))
+}
+
+/// Sends with pacing, retrying 429/5xx (honouring retry-after) and transport
+/// errors with exponential backoff. `make` builds a fresh request each try.
+async fn reply_with(make: impl Fn() -> reqwest::RequestBuilder) -> Result<Reply, String> {
+    let mut last = String::new();
+    for attempt in 0..ATTEMPTS {
+        pace().await;
+        let backoff = std::time::Duration::from_millis(250 << attempt);
+        match make().send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let headers = resp.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
+                let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+                let r = Reply { status, body, headers };
+                if status == 429 || (500..600).contains(&status) {
+                    last = format!("{status} {}", String::from_utf8_lossy(&r.body));
+                    tokio::time::sleep(retry_after(&r).unwrap_or(backoff).max(backoff)).await;
+                    continue;
+                }
+                return Ok(r);
+            }
+            Err(e) => {
+                last = e.to_string();
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+    Err(format!("giving up after {ATTEMPTS} attempts: {last}"))
 }
 
 impl Registry {
@@ -46,12 +99,12 @@ impl Registry {
     pub async fn login(&mut self, user: &str, password: &str) -> Result<(), String> {
         let url = format!("https://{}/token", self.host);
         let scope = format!("repository:{}:pull,push", self.repo);
-        let r = reply(
+        let r = reply_with(|| {
             crate::http::client()
-                .get(url)
+                .get(&url)
                 .query(&[("service", self.host.as_str()), ("scope", scope.as_str())])
-                .basic_auth(user, Some(password)),
-        )
+                .basic_auth(user, Some(password))
+        })
         .await?;
         if r.status != 200 {
             return Err(format!("registry login failed: {} {}", r.status, String::from_utf8_lossy(&r.body)));
@@ -70,13 +123,13 @@ impl Registry {
     }
 
     pub async fn blob_exists(&self, hash: &str) -> Result<bool, String> {
-        let r = reply(self.auth(crate::http::client().head(format!("{}/blobs/sha256:{hash}", self.base)))).await?;
+        let r = reply_with(|| self.auth(crate::http::client().head(format!("{}/blobs/sha256:{hash}", self.base)))).await?;
         Ok(r.status == 200)
     }
 
     /// Reads a blob (following GHCR's redirect) and checks its digest.
     pub async fn get_blob(&self, hash: &str) -> Result<Vec<u8>, String> {
-        let r = reply(self.auth(crate::http::client().get(format!("{}/blobs/sha256:{hash}", self.base)))).await?;
+        let r = reply_with(|| self.auth(crate::http::client().get(format!("{}/blobs/sha256:{hash}", self.base)))).await?;
         if r.status != 200 {
             return Err(format!("get blob {hash}: {}", r.status));
         }
@@ -88,7 +141,7 @@ impl Registry {
 
     /// The blob GET response itself, without following a redirect.
     pub async fn get_blob_raw(&self, hash: &str) -> Result<Reply, String> {
-        reply(self.auth(crate::http::no_redirect_client().get(format!("{}/blobs/sha256:{hash}", self.base)))).await
+        reply_with(|| self.auth(crate::http::no_redirect_client().get(format!("{}/blobs/sha256:{hash}", self.base)))).await
     }
 
     /// Uploads a blob (monolithic POST then PUT) unless present. Returns its
@@ -98,18 +151,30 @@ impl Registry {
         if self.blob_exists(&hash).await? {
             return Ok(hash);
         }
-        let r = reply(self.auth(crate::http::client().post(format!("{}/blobs/uploads/", self.base)))).await?;
+        // Single-request monolithic upload (POST with digest and body): one
+        // request instead of two. Registries that do not support it answer
+        // 202 with a session, which we then complete with a PUT.
+        let r = reply_with(|| {
+            self.auth(crate::http::client().post(format!("{}/blobs/uploads/", self.base)))
+                .query(&[("digest", format!("sha256:{hash}"))])
+                .header("Content-Type", "application/octet-stream")
+                .body(data.to_vec())
+        })
+        .await?;
+        if r.status == 201 {
+            return Ok(hash);
+        }
         if r.status != 202 {
             return Err(format!("start upload: {} {}", r.status, String::from_utf8_lossy(&r.body)));
         }
         let loc = r.header("Location").ok_or("upload has no Location")?.to_string();
         let url = if loc.starts_with("http") { loc } else { format!("https://{}{loc}", self.host) };
         let sep = if url.contains('?') { '&' } else { '?' };
-        let r = reply(
+        let r = reply_with(|| {
             self.auth(crate::http::client().put(format!("{url}{sep}digest=sha256:{hash}")))
                 .header("Content-Type", "application/octet-stream")
-                .body(data.to_vec()),
-        )
+                .body(data.to_vec())
+        })
         .await?;
         if r.status != 201 {
             return Err(format!("finish upload: {} {}", r.status, String::from_utf8_lossy(&r.body)));
@@ -120,11 +185,11 @@ impl Registry {
     /// Puts a manifest under `reference` (a tag or `sha256:<hex>`). Returns
     /// the manifest's digest as the registry reports it.
     pub async fn put_manifest(&self, reference: &str, media_type: &str, body: &[u8]) -> Result<String, String> {
-        let r = reply(
+        let r = reply_with(|| {
             self.auth(crate::http::client().put(format!("{}/manifests/{reference}", self.base)))
                 .header("Content-Type", media_type)
-                .body(body.to_vec()),
-        )
+                .body(body.to_vec())
+        })
         .await?;
         if r.status != 201 {
             return Err(format!("put manifest {reference}: {} {}", r.status, String::from_utf8_lossy(&r.body)));
@@ -133,15 +198,37 @@ impl Registry {
     }
 
     pub async fn get_manifest(&self, reference: &str) -> Result<Reply, String> {
-        reply(
+        reply_with(|| {
             self.auth(crate::http::client().get(format!("{}/manifests/{reference}", self.base)))
-                .header("Accept", format!("{MANIFEST_MEDIA_TYPE}, {INDEX_MEDIA_TYPE}")),
-        )
+                .header("Accept", format!("{MANIFEST_MEDIA_TYPE}, {INDEX_MEDIA_TYPE}"))
+        })
         .await
     }
 
     /// OCI 1.1 referrers API. 404 means the registry does not support it.
     pub async fn referrers(&self, digest: &str) -> Result<Reply, String> {
-        reply(self.auth(crate::http::client().get(format!("{}/referrers/{digest}", self.base)))).await
+        reply_with(|| self.auth(crate::http::client().get(format!("{}/referrers/{digest}", self.base)))).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply(headers: Vec<(&str, &str)>, body: &str) -> Reply {
+        Reply { status: 429, body: body.as_bytes().to_vec(), headers: headers.into_iter().map(|(k, v)| (k.into(), v.into())).collect() }
+    }
+
+    #[test]
+    fn retry_after_from_ghcr_body() {
+        let r = reply(vec![], r#"{"errors":[{"code":"TOOMANYREQUESTS","message":"retry-after: 17.763137ms, allowed: 2000/minute"}]}"#);
+        let d = retry_after(&r).unwrap();
+        assert!(d > std::time::Duration::from_millis(17) && d < std::time::Duration::from_millis(18));
+    }
+
+    #[test]
+    fn retry_after_from_header_seconds() {
+        assert_eq!(retry_after(&reply(vec![("Retry-After", "2")], "")), Some(std::time::Duration::from_secs(2)));
+        assert_eq!(retry_after(&reply(vec![], "nothing here")), None);
     }
 }
