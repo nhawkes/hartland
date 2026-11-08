@@ -260,6 +260,22 @@ fn run(args: &[String]) -> Result<(), String> {
         "sandbox setup" => return hartland::sandbox::setup(),
         "sandbox run" => return sandbox_run(rest),
         "oci probe" => return oci_probe(&flags(rest)?),
+        // Test helper: copy a manifest to another tag (e.g. to forge an entry).
+        "oci retag" => {
+            let f = flags(rest)?;
+            let host = need(&f, "registry")?;
+            let mut reg = hartland::oci::Registry::new(host, need(&f, "repo")?);
+            let user = std::env::var("REGISTRY_USER").map_err(|_| "REGISTRY_USER not set")?;
+            let pass = std::env::var("REGISTRY_PASSWORD").map_err(|_| "REGISTRY_PASSWORD not set")?;
+            reg.login(host, &user, &pass)?;
+            let m = reg.get_manifest(need(&f, "from")?)?;
+            if m.status != 200 {
+                return Err(format!("get manifest: {}", m.status));
+            }
+            let media = m.header("Content-Type").unwrap_or(hartland::oci::MANIFEST_MEDIA_TYPE).to_string();
+            println!("{}", reg.put_manifest(need(&f, "to")?, &media, &m.body)?);
+            return Ok(());
+        }
         "proxy put" => {
             let f = flags(rest)?;
             let addr = need(&f, "addr")?.to_string();
@@ -281,6 +297,55 @@ fn run(args: &[String]) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
                 println!("{}/{}", digest.hash, digest.size_bytes);
                 Ok(())
+            });
+        }
+        // Test client: `ac-put --action <name>` stores a result for a synthetic
+        // action; `ac-get --action <name> --expect found|missing` checks it.
+        "proxy ac-put" | "proxy ac-get" => {
+            let f = flags(rest)?;
+            let addr = need(&f, "addr")?.to_string();
+            let name = need(&f, "action")?.to_string();
+            let expect = f.get("expect").cloned();
+            let put = cmd == "proxy ac-put";
+            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            return rt.block_on(async move {
+                use hartland::reapi::re;
+                let action = format!("hartland test action {name}").into_bytes();
+                let action_digest = re::Digest { hash: hartland::attest::sha256_hex(&action), size_bytes: action.len() as i64 };
+                let mut ac = re::action_cache_client::ActionCacheClient::connect(addr.clone()).await.map_err(|e| e.to_string())?;
+                if put {
+                    let out = format!("output of {name}").into_bytes();
+                    let out_digest = re::Digest { hash: hartland::attest::sha256_hex(&out), size_bytes: out.len() as i64 };
+                    let mut cas = re::content_addressable_storage_client::ContentAddressableStorageClient::connect(addr).await.map_err(|e| e.to_string())?;
+                    cas.batch_update_blobs(re::BatchUpdateBlobsRequest {
+                        requests: vec![re::batch_update_blobs_request::Request { digest: Some(out_digest.clone()), data: out, compressor: 0 }],
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let result = re::ActionResult {
+                        output_files: vec![re::OutputFile { path: "out.txt".into(), digest: Some(out_digest), ..Default::default() }],
+                        exit_code: 0,
+                        ..Default::default()
+                    };
+                    ac.update_action_result(re::UpdateActionResultRequest { action_digest: Some(action_digest.clone()), action_result: Some(result), ..Default::default() })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    println!("stored {}", action_digest.hash);
+                    return Ok(());
+                }
+                let got = ac.get_action_result(re::GetActionResultRequest { action_digest: Some(action_digest.clone()), ..Default::default() }).await;
+                let found = match &got {
+                    Ok(_) => true,
+                    Err(s) if s.code() == tonic::Code::NotFound => false,
+                    Err(s) => return Err(format!("unexpected: {s}")),
+                };
+                println!("{} {}", action_digest.hash, if found { "found" } else { "missing" });
+                match expect.as_deref() {
+                    Some("found") if !found => Err("expected found".to_string()),
+                    Some("missing") if found => Err("expected missing".to_string()),
+                    _ => Ok(()),
+                }
             });
         }
         "proxy check" => {
