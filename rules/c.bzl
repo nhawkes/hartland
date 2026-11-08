@@ -5,6 +5,12 @@ nothing is copied into the repository and the prelude's C++ machinery is not
 involved. `tree_c` takes an explicit source list; packages that discover their
 sources inside the build (from a dynamic action) call the action-level helpers
 `tree_c_includes`, `tree_c_compile` and `tree_c_archive` directly.
+
+C++ (`.cpp`, `.cc`, `.cxx` sources) compiles with `zig c++`, which brings
+Zig's bundled libc++ headers. C++ code is built against a `zig_libc`: a
+libc installation (our musl, kernel headers, crt objects) that zig is pointed
+at through a libc paths file in `ZIG_LIBC`, so zig neither uses its own
+bundled musl nor looks at the host. `tree_cxx_link` links against it.
 """
 
 TreeObjectsInfo = provider(fields = {
@@ -16,6 +22,19 @@ def tree_c_obj_name(src: str) -> str:
     """The object name for a source path: its extension replaced by .o."""
     base = src.rsplit(".", 1)[0]
     return base + ".o"
+
+_CXX_EXTS = ["cpp", "cc", "cxx"]
+
+ZigLibcInfo = provider(fields = {
+    # The libc paths file zig reads from $ZIG_LIBC.
+    "file": provider_field(Artifact),
+    # The installation it names: include/ and lib/.
+    "root": provider_field(Artifact),
+})
+
+def zig_libc_env(libc: ZigLibcInfo) -> dict[str, typing.Any]:
+    """The action environment that makes zig use `libc`."""
+    return {"ZIG_LIBC": cmd_args(libc.file, hidden = [libc.root])}
 
 def _parent(p):
     return p.rsplit("/", 1)[0] if "/" in p else ""
@@ -45,8 +64,10 @@ def tree_c_compile(
         includes: list[cmd_args],
         hidden: list[Artifact],
         target: str,
-        input_dirs: list[str]) -> Artifact:
-    """Compiles `src` (a path inside `tree`) to obj/<src stem>.o. `hidden` is
+        input_dirs: list[str],
+        env: dict[str, typing.Any] = {}) -> Artifact:
+    """Compiles `src` (a path inside `tree`) to obj/<src stem>.o, as C++ for
+    C++ extensions and C (or assembly) otherwise. `hidden` is
     the tree plus any generated header directory. With `input_dirs`, the
     action gets only those tree directories, the source's own directory and
     (for arch subdirectories) its parent instead of the whole tree: far
@@ -59,7 +80,7 @@ def tree_c_compile(
     actions.run(
         cmd_args(
             zig,
-            "cc",
+            "c++" if src.rsplit(".", 1)[-1] in _CXX_EXTS else "cc",
             "-target",
             target,
             "-c",
@@ -70,6 +91,7 @@ def tree_c_compile(
             includes,
             hidden = hidden,
         ),
+        env = env,
         category = "cc",
         identifier = src,
     )
@@ -82,6 +104,64 @@ def tree_c_archive(actions: AnalysisActions, zig: typing.Any, out: OutputArtifac
         cmd_args(zig, "ar", "rcs", out, cmd_args(argsfile, format = "@{}"), hidden = objects.values()),
         category = "ar",
     )
+
+def tree_cxx_link(
+        actions: AnalysisActions,
+        zig: typing.Any,
+        out: OutputArtifact,
+        objects: list[Artifact],
+        archives: list[Artifact],
+        libc: ZigLibcInfo,
+        flags: list[str],
+        target: str):
+    """Links a static C++ executable against `libc`, with Zig's libc++.
+    `archives` must be in link order (dependents before dependencies).
+    `flags` should carry the optimisation level: zig builds libc++ for the
+    link in the mode it implies (no -O means Debug, with UBSan traps)."""
+    argsfile = actions.write("link.args", objects + archives)
+    actions.run(
+        cmd_args(
+            zig,
+            "c++",
+            "-target",
+            target,
+            "-static",
+            flags,
+            cmd_args(argsfile, format = "@{}"),
+            "-o",
+            out,
+            hidden = objects + archives,
+        ),
+        env = zig_libc_env(libc),
+        category = "link",
+    )
+
+def _zig_libc_impl(ctx: AnalysisContext) -> list[Provider]:
+    root = ctx.attrs.root[DefaultInfo].default_outputs[0]
+    # Paths are relative to the action's working directory (the project
+    # root), where zig resolves them.
+    file = ctx.actions.write(
+        "libc.txt",
+        cmd_args(
+            cmd_args("include_dir=", root.project("include"), delimiter = ""),
+            cmd_args("sys_include_dir=", root.project("include"), delimiter = ""),
+            cmd_args("crt_dir=", root.project("lib"), delimiter = ""),
+            # Where zig looks for crtbegin.o and crtend.o.
+            cmd_args("cc_dir=", root.project("lib"), delimiter = ""),
+            "msvc_lib_dir=",
+            "kernel32_lib_dir=",
+            "darwin_sdk_dir=",
+        ),
+    )
+    return [DefaultInfo(default_output = file, other_outputs = [root]), ZigLibcInfo(file = file, root = root)]
+
+# A libc installation for zig: `root` holds include/ (libc and kernel
+# headers) and lib/ (crt1.o crti.o crtn.o crtbegin.o crtend.o libc.a and the
+# empty libm.a etc. that musl installs).
+zig_libc = rule(
+    impl = _zig_libc_impl,
+    attrs = {"root": attrs.dep()},
+)
 
 def _tree_c_impl(ctx: AnalysisContext) -> list[Provider]:
     zig = ctx.attrs._zig[RunInfo]

@@ -50,14 +50,26 @@ _UNPACK = """
 mkdir -p "$OUT"
 tmp="$PWD/$BUCK_SCRATCH_PATH/unpack"
 rm -rf "$tmp"; mkdir -p "$tmp"
+# tar arguments: --exclude=<pattern> for each of $EXCLUDES, then the members
+# in $MEMBERS (both newline-separated; no members means everything).
+IFS='
+'
+set -f
+set --
+for e in $EXCLUDES; do set -- "$@" "--exclude=$e"; done
+for m in $MEMBERS; do set -- "$@" "$m"; done
 case "$ARCHIVE" in
-  *.tar.xz|*.txz)   xz -dc "$ARCHIVE" | tar -x -f - -C "$tmp" ;;
-  *.tar.gz|*.tgz)   gzip -dc "$ARCHIVE" | tar -x -f - -C "$tmp" ;;
-  *.tar.bz2|*.tbz2) bzip2 -dc "$ARCHIVE" | tar -x -f - -C "$tmp" ;;
-  *.tar)            tar -x -f "$ARCHIVE" -C "$tmp" ;;
-  *.zip)            unzip -q "$ARCHIVE" -d "$tmp" ;;
+  *.tar.xz|*.txz)   xz -dc "$ARCHIVE" | tar -x -f - -C "$tmp" "$@" ;;
+  *.tar.gz|*.tgz)   gzip -dc "$ARCHIVE" | tar -x -f - -C "$tmp" "$@" ;;
+  *.tar.bz2|*.tbz2) bzip2 -dc "$ARCHIVE" | tar -x -f - -C "$tmp" "$@" ;;
+  *.tar)            tar -x -f "$ARCHIVE" -C "$tmp" "$@" ;;
+  *.zip)
+    [ $# -eq 0 ] || { echo "pinned_archive: paths/excludes are not supported for zip" >&2; exit 1; }
+    unzip -q "$ARCHIVE" -d "$tmp" ;;
   *) echo "pinned_archive: unsupported archive type: $ARCHIVE" >&2; exit 1 ;;
 esac
+set +f
+unset IFS
 src="$tmp${STRIP_PREFIX:+/$STRIP_PREFIX}"
 [ -d "$src" ] || { echo "pinned_archive: strip_prefix not found: $STRIP_PREFIX" >&2; exit 1; }
 for f in "$src"/* "$src"/.[!.]* "$src"/..?*; do
@@ -72,6 +84,7 @@ def _pinned_archive_impl(ctx: AnalysisContext) -> list[Provider]:
     archive = ctx.actions.declare_output("archive", _basename(url))
     ctx.actions.download_file(archive.as_output(), url, sha256 = ctx.attrs.sha256)
     out = ctx.actions.declare_output(ctx.label.name, dir = True)
+    prefix = ctx.attrs.strip_prefix + "/" if ctx.attrs.strip_prefix else ""
     sh_action(
         ctx,
         ctx.attrs._sh[ShellInfo],
@@ -79,6 +92,8 @@ def _pinned_archive_impl(ctx: AnalysisContext) -> list[Provider]:
         env = {
             "ARCHIVE": cmd_args(archive),
             "OUT": out.as_output(),
+            "EXCLUDES": "\n".join([prefix + e for e in ctx.attrs.excludes]),
+            "MEMBERS": "\n".join([prefix + p for p in ctx.attrs.paths]),
             "STRIP_PREFIX": ctx.attrs.strip_prefix or "",
         },
         hidden = [archive],
@@ -89,6 +104,12 @@ def _pinned_archive_impl(ctx: AnalysisContext) -> list[Provider]:
 _pinned_archive = rule(
     impl = _pinned_archive_impl,
     attrs = {
+        # tar only: glob patterns (relative to strip_prefix) left unpacked.
+        "excludes": attrs.list(attrs.string(), default = []),
+        # tar only: the members (relative to strip_prefix) to unpack; empty
+        # means the whole archive. The download is still the whole, pinned
+        # archive: this only keeps unused parts of large trees off disk.
+        "paths": attrs.list(attrs.string(), default = []),
         "sha256": attrs.string(),
         "strip_prefix": attrs.option(attrs.string(), default = None),
         "urls": attrs.list(attrs.string()),
