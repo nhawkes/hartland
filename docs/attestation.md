@@ -133,10 +133,21 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
 
 ## Open questions
 
-1. GHCR: referrers API, rate limits, behaviour with many small blobs.
-2. Actions concurrency limits and terms of use for long-lived worker jobs.
+1. Actions concurrency limits and terms of use for long-lived worker jobs.
 
 ## Settled
+
+- GHCR (private package, pushed from Actions with GITHUB_TOKEN):
+  - No OCI referrers API (`/v2/<repo>/referrers/<digest>` returns 404
+    MANIFEST_UNKNOWN), though manifests with `subject` are accepted. So the
+    signature is carried by annotation + layer on the entry itself.
+  - Small blobs: ~1.1 s each sequentially (HEAD + POST + PUT); with 16 in
+    parallel, ~92 ms each effective (300 in 28 s). No failures, no
+    rate-limit headers seen. Existence checks 35–185 ms each.
+  - Blob GET is a 307 to pkg-containers.githubusercontent.com; one early
+    read failed, later reads succeeded: retry reads.
+  - Manifests by tag round-trip byte for byte; anonymous reads of a private
+    package get 401.
 
 - Sandbox on a hosted runner (`hartland sandbox run`, bubblewrap as uid
   hlsandbox, empty tmpfs root): with OIDC credentials present in the
