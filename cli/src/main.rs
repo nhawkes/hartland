@@ -10,7 +10,11 @@ const USAGE: &str = "usage:
   hartland attest verify --envelope <envelope.json> --keyring <keyring.json> --jwks <jwks.json>
       Verify an envelope against a keyring and GitHub's key archive.
   hartland jwks update --jwks <jwks.json>
-      Merge GitHub's current signing keys into the archive (never removes).";
+      Merge GitHub's current signing keys into the archive (never removes).
+  hartland sandbox setup
+      Prepare a GitHub-hosted runner for sandboxed actions (needs sudo).
+  hartland sandbox run --input <dir> --collect <dir> [--output <path>]... [--env K=V]... [--no-drop-user] -- <argv>...
+      Run one action in the sandbox; copy declared outputs to --collect.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,11 +53,58 @@ fn write_json<T: serde::Serialize>(path: &str, v: &T) -> Result<(), String> {
     std::fs::write(path, s).map_err(|e| format!("{path}: {e}"))
 }
 
+fn sandbox_run(args: &[String]) -> Result<(), String> {
+    let split = args.iter().position(|a| a == "--").ok_or_else(|| format!("missing -- before argv\n{USAGE}"))?;
+    let (opts, argv) = (&args[..split], &args[split + 1..]);
+    let (mut input, mut collect, mut outputs, mut env, mut drop_user) = (None, None, Vec::new(), Vec::new(), true);
+    let mut it = opts.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--input" => input = Some(val()?),
+            "--collect" => collect = Some(val()?),
+            "--output" => outputs.push(val()?),
+            "--env" => {
+                let kv = val()?;
+                let (k, v) = kv.split_once('=').ok_or_else(|| format!("--env wants K=V, got {kv}"))?;
+                env.push((k.to_string(), v.to_string()));
+            }
+            "--no-drop-user" => drop_user = false,
+            _ => return Err(format!("unexpected argument {a}\n{USAGE}")),
+        }
+    }
+    let input = input.ok_or("missing --input")?;
+    let collect = collect.ok_or("missing --collect")?;
+    let outcome = hartland::sandbox::exec(&hartland::sandbox::Spec {
+        input: std::path::Path::new(&input),
+        argv,
+        env: &env,
+        outputs: &outputs,
+        collect: std::path::Path::new(&collect),
+        drop_user,
+    })?;
+    use std::io::Write as _;
+    std::io::stdout().write_all(&outcome.stdout).map_err(|e| e.to_string())?;
+    std::io::stderr().write_all(&outcome.stderr).map_err(|e| e.to_string())?;
+    if !outcome.missing.is_empty() {
+        return Err(format!("missing outputs: {}", outcome.missing.join(", ")));
+    }
+    if outcome.exit_code != 0 {
+        return Err(format!("action exited with {}", outcome.exit_code));
+    }
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let (cmd, rest) = match args {
         [a, b, rest @ ..] => (format!("{a} {b}"), rest),
         _ => return Err(USAGE.to_string()),
     };
+    match cmd.as_str() {
+        "sandbox setup" => return hartland::sandbox::setup(),
+        "sandbox run" => return sandbox_run(rest),
+        _ => {}
+    }
     let f = flags(rest)?;
     match cmd.as_str() {
         "attest sign" => {
