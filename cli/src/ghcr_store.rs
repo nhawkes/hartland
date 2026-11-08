@@ -57,6 +57,9 @@ pub struct GhcrStore {
     /// Blobs that verified results reference and the registry retains (their
     /// per-action manifests list them as layers): present, fetched on demand.
     known: Mutex<std::collections::HashSet<String>>,
+    /// Results served via per-action lookup this run, grouped by the envelope
+    /// that signed them: published as bundles so the index covers them too.
+    reindex: Mutex<HashMap<String, Vec<(String, re::ActionResult)>>>,
 }
 
 /// One batch's results, so readers need one request per batch rather than a
@@ -101,6 +104,7 @@ impl GhcrStore {
             verified: Mutex::new(HashMap::new()),
             indexed: Mutex::new(HashMap::new()),
             known: Mutex::new(std::collections::HashSet::new()),
+            reindex: Mutex::new(HashMap::new()),
         }
     }
 
@@ -172,6 +176,8 @@ impl GhcrStore {
             return Some(p.clone());
         }
         let bytes = get_blob_retrying(reg, envelope_hash).await.ok()?;
+        // Keep it: re-indexing needs its exact size, and it is content-addressed.
+        let _ = self.local.put_blob(envelope_hash, &bytes).await;
         let env: Envelope = serde_json::from_slice(&bytes).ok()?;
         let (statement, _signer) = crate::verify_envelope(&env, &self.jwks, &self.keyring).ok()?;
         let pairs: HashMap<String, String> =
@@ -197,7 +203,47 @@ impl GhcrStore {
         }
         let bytes = get_blob_retrying(reg, config_hash).await.ok()?;
         let result = re::ActionResult::decode(bytes.as_slice()).ok()?;
-        if self.prefetch(&result).await { Some(result) } else { None }
+        if !self.prefetch(&result).await {
+            return None;
+        }
+        if let Ok(mut r) = self.reindex.lock() {
+            r.entry(env_hash.to_string()).or_default().push((action.to_string(), result.clone()));
+        }
+        Some(result)
+    }
+
+    /// Bundles for results served via per-action lookup, signed by earlier
+    /// envelopes, so the next reader finds them in the index. Nothing new is
+    /// trusted: readers verify every entry against the original envelope.
+    async fn publish_reindex(&self, writer: &Registry) -> Result<usize, String> {
+        let groups: Vec<(String, Vec<(String, re::ActionResult)>)> =
+            std::mem::take(&mut *self.reindex.lock().map_err(|_| "poisoned")?).into_iter().collect();
+        let mut n = 0;
+        for (env_hash, entries) in groups {
+            let envelope = self.local.get_blob(&env_hash).await;
+            let env_len = match envelope {
+                Some(e) => e.len(),
+                None => match self.readers.first() {
+                    Some(r) => get_blob_retrying(r, &env_hash).await.map(|e| e.len()).unwrap_or(0),
+                    None => 0,
+                },
+            };
+            let mut bundle = Bundle { entries: Vec::new() };
+            use base64::Engine as _;
+            for (action, result) in &entries {
+                let refs = self.referenced_blobs(result).await?;
+                bundle.entries.push(BundleEntry {
+                    action: action.clone(),
+                    result: base64::engine::general_purpose::STANDARD.encode(result.encode_to_vec()),
+                    blobs: refs.into_iter().collect(),
+                });
+            }
+            let bytes = serde_json::to_vec(&bundle).map_err(|e| e.to_string())?;
+            let bundle_hash = writer.put_blob(&bytes).await?;
+            self.append_index(writer, (&env_hash, env_len), (&bundle_hash, bytes.len())).await?;
+            n += entries.len();
+        }
+        Ok(n)
     }
 
     /// Downloads a verified result's blobs into the local store.
@@ -231,11 +277,21 @@ impl GhcrStore {
     /// Signs everything written this run as one batch and pushes it.
     /// Returns the number of results published.
     pub async fn publish(&self) -> Result<usize, String> {
+        let Some(writer) = self.writer.as_ref() else {
+            return if self.pending.lock().map_err(|_| "poisoned")?.is_empty() {
+                Ok(0)
+            } else {
+                Err("results pending but no writable namespace configured".to_string())
+            };
+        };
+        let reindexed = self.publish_reindex(writer).await?;
+        if reindexed > 0 {
+            eprintln!("hartland proxy: indexed {reindexed} previously signed result(s)");
+        }
         let pending: Vec<_> = std::mem::take(&mut *self.pending.lock().map_err(|_| "poisoned")?);
         if pending.is_empty() {
             return Ok(0);
         }
-        let writer = self.writer.as_ref().ok_or("results pending but no writable namespace configured")?;
         let mut pairs = Vec::new();
         let mut configs = Vec::new();
         for (action, size, result) in &pending {
