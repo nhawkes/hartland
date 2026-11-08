@@ -96,21 +96,7 @@ if [ "${MAX_WORKERS:-0}" -gt 0 ] && [ -n "${GITHUB_WORKFLOW_REF:-}" ]; then
     scale_args=(--worker-workflow "${caller_workflow##*/}" --worker-ref "$GITHUB_REF_NAME" --max-workers "$MAX_WORKERS")
     log "scale-out: up to $MAX_WORKERS workers of ${caller_workflow##*/} on $GITHUB_REF_NAME"
 fi
-# Cold: phase 1 reads no cache tier, so every action executes again (results
-# go to a fresh first tier; phase 2 then checks them as usual).
-phase1_args=("${registry_args[@]}")
-if [ "${COLD:-false}" = true ]; then
-    phase1_args=(--registry ghcr.io --keyring "$work/keyring.json" --jwks "$hl/keys/github-actions-jwks.json")
-    if [ -n "${HARTLAND_L1:-}" ]; then
-        rm -rf "$HARTLAND_L1" && mkdir -p "$HARTLAND_L1"
-        phase1_args+=(--l1 "$HARTLAND_L1")
-    fi
-    log "cold: phase 1 reads no cache"
-fi
-registry_args_saved=("${registry_args[@]}")
-registry_args=("${phase1_args[@]}")
 serve "$work/store1" "$promote" --write "$namespace" "${scale_args[@]}"
-registry_args=("${registry_args_saved[@]}")
 build first && log "first build succeeded" || { log "first build FAILED"; kill -TERM "$proxy"; wait "$proxy" || true; exit 1; }
 
 # Package attestations: one signed statement per target, binding its output

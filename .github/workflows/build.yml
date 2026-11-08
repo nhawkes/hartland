@@ -41,10 +41,6 @@ on:
         description: most workers the coordinator dispatches at once (0 disables scale-out)
         type: number
         default: 4
-      cold:
-        description: ignore both cache tiers in phase 1 and execute everything (a reproducibility check)
-        type: boolean
-        default: false
 jobs:
   build:
     if: inputs.role != 'worker'
@@ -97,7 +93,6 @@ jobs:
           HARTLAND_L1: ${{ runner.temp }}/hartland-l1
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           MAX_WORKERS: ${{ inputs.max_workers }}
-          COLD: ${{ inputs.cold }}
           # Only the coordinator process sees it (buck2 and actions run with
           # empty environments): it dispatches workers.
           GITHUB_TOKEN: ${{ github.token }}

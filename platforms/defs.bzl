@@ -33,6 +33,11 @@ def _platform(ctx, name, cfg, remote):
         _check_image(ctx.attrs.container_image)
         props = dict(_REMOTE_PROPERTIES)
         props["container-image"] = ctx.attrs.container_image
+        # Part of every action's digest (REAPI hashes platform properties),
+        # ignored by executors: changing it makes every action miss the
+        # cache and execute again, with no other effect.
+        if ctx.attrs.cache_seed:
+            props["hartland-cache-seed"] = ctx.attrs.cache_seed
         # remote_only (attested builds): nothing runs locally, so no build
         # code shares a uid with the signing proxy, and nothing is uploaded
         # from the client: the proxy only vouches for actions it executed.
@@ -92,5 +97,7 @@ hartland_execution_platform = rule(
         "remote": attrs.bool(default = False),
         "remote_cache": attrs.bool(default = False),
         "remote_only": attrs.bool(default = False),
+        # Change to execute every remote action again (see `_platform`).
+        "cache_seed": attrs.string(default = ""),
     },
 )
