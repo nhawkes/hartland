@@ -168,3 +168,56 @@ fn jwks_merge_keeps_old_keys_and_refuses_changed_material() {
     newer.keys[0].n = "AQAB".into();
     assert!(archive.merge(&newer).is_err());
 }
+
+// ---- package attestations ----
+
+fn package_envelope(repo_claim: &str, sha_claim: Option<&str>, predicate_repo: &str, predicate_commit: &str) -> Envelope {
+    use hartland::package::{Package, PackageStatement};
+    let st = PackageStatement::new(
+        Package { target: "packages//examples/hello:hello".into(), repository: predicate_repo.into(), commit: predicate_commit.into() },
+        [("hello".to_string(), digest('f').hash)].into(),
+    );
+    let p = hartland::package::statement_bytes(&st);
+    let mut c = claims(&audience_for(&p));
+    c["repository"] = json!(repo_claim);
+    match sha_claim {
+        Some(s) => c["sha"] = json!(s),
+        None => {
+            c.as_object_mut().unwrap().remove("sha");
+        }
+    }
+    Envelope::new(&p, sign(json!({"alg": "RS256", "kid": KID}), c))
+}
+
+#[test]
+fn package_accepts_matching_source() {
+    let env = package_envelope("someone/pkgs", Some("abc123"), "someone/pkgs", "abc123");
+    let (st, signer) = hartland::package::verify(&env, &jwks(), &keyring()).unwrap();
+    assert_eq!(st.digest_of("hello"), Some(digest('f').hash.as_str()));
+    assert_eq!(signer.source_commit.as_deref(), Some("abc123"));
+}
+
+#[test]
+fn package_rejects_claimed_repository_mismatch() {
+    let env = package_envelope("someone/pkgs", Some("abc123"), "victim/pkgs", "abc123");
+    assert!(hartland::package::verify(&env, &jwks(), &keyring()).unwrap_err().contains("ran for someone/pkgs"));
+}
+
+#[test]
+fn package_rejects_claimed_commit_mismatch() {
+    let env = package_envelope("someone/pkgs", Some("abc123"), "someone/pkgs", "def456");
+    assert!(hartland::package::verify(&env, &jwks(), &keyring()).unwrap_err().contains("commit def456"));
+}
+
+#[test]
+fn package_rejects_token_without_commit() {
+    let env = package_envelope("someone/pkgs", None, "someone/pkgs", "abc123");
+    assert!(hartland::package::verify(&env, &jwks(), &keyring()).is_err());
+}
+
+#[test]
+fn package_rejects_action_batch_as_package() {
+    // A signed action-results batch must not pass as a package attestation.
+    assert!(hartland::package::verify(&envelope_with(|_| {}), &jwks(), &keyring()).unwrap_err().contains("bad package statement")
+        || hartland::package::verify(&envelope_with(|_| {}), &jwks(), &keyring()).unwrap_err().contains("not a hartland package"));
+}

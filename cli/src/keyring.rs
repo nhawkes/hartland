@@ -25,7 +25,10 @@ pub struct Keyring {
 pub struct Signer {
     pub workflow: String,
     pub commit: String,
+    /// The calling repository and the commit it built (token `repository`
+    /// and `sha` claims): GitHub's word for what source was built.
     pub repository: String,
+    pub source_commit: Option<String>,
     pub run_id: String,
 }
 
@@ -65,6 +68,7 @@ impl Keyring {
             workflow: workflow.to_string(),
             commit: job_sha.to_string(),
             repository: claim(claims, "repository")?.to_string(),
+            source_commit: claims.get("sha").and_then(|v| v.as_str()).map(str::to_string),
             run_id: claim(claims, "run_id")?.to_string(),
         })
     }

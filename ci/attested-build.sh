@@ -86,6 +86,32 @@ CFG
 log "phase 1: build, execute in the sandbox, sign, publish"
 serve "$work/store1" --write "$namespace"
 build first && log "first build succeeded" || { log "first build FAILED"; kill -TERM "$proxy"; wait "$proxy" || true; exit 1; }
+
+# Package attestations: one signed statement per target, binding its output
+# files to the source repository and commit (checked against the token's own
+# claims by verifiers).
+log "package attestations"
+pkgs="$out/packages"; mkdir -p "$pkgs"
+sudo -u hlbuild env -i HOME=/home/hlbuild PATH=/usr/bin:/bin \
+    sh -c "cd /home/hlbuild/build-first && /home/hlbuild/buck2 build $targets --materializations=all --show-full-json-output" \
+    2>/dev/null > "$work/outputs.json" || log "could not list outputs"
+python3 - "$work/outputs.json" > "$work/outputs.tsv" <<'PY'
+import json, sys
+for label, path in sorted(json.load(open(sys.argv[1])).items()):
+    print(f"{label}\t{path}")
+PY
+n=0
+while IFS=$'\t' read -r label path; do
+    [ -n "$label" ] || continue
+    if [ ! -f "$path" ]; then log "skip $label: output is not a single file"; continue; fi
+    n=$((n + 1)); name="$(basename "$path")"; dir="$pkgs/$n"; mkdir -p "$dir"
+    cp "$path" "$dir/$name"
+    printf '%s\n' "$label" > "$dir/target.txt"
+    "$hartland" attest package --target "$label" --repository "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" \
+        --output "$name=$dir/$name" --out "$dir/attestation.json" 2>&1 | tee -a "$out/summary.txt" >&2
+done < "$work/outputs.tsv"
+cp "$work/keyring.json" "$out/keyring.json"
+
 kill -TERM "$proxy"; wait "$proxy" || true
 grep -E 'published|publish failed' "$out/proxy.log" | tail -1 | tee -a "$out/summary.txt" >&2 || true
 

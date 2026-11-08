@@ -116,6 +116,65 @@ fn with_execution(
     Ok(proxy.with_executor(hartland::execute::Executor::new(store, drop_user, scratch)))
 }
 
+/// `attest package --target T --repository R --commit C --out env.json --output name=path...`
+/// `attest verify-package --envelope e --keyring k --jwks j [--output name=path...]`
+fn package_cmd(cmd: &str, args: &[String]) -> Result<(), String> {
+    use hartland::package::{Package, PackageStatement};
+    let mut single = HashMap::new();
+    let mut outputs = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let k = a.strip_prefix("--").ok_or_else(|| format!("unexpected argument {a}\n{USAGE}"))?;
+        let v = it.next().ok_or_else(|| format!("--{k} needs a value"))?;
+        if k == "output" {
+            let (name, path) = v.split_once('=').ok_or_else(|| format!("--output wants name=path, got {v}"))?;
+            outputs.push((name.to_string(), path.to_string()));
+        } else {
+            single.insert(k.to_string(), v.clone());
+        }
+    }
+    let hash = |path: &str| -> Result<String, String> {
+        Ok(hartland::attest::sha256_hex(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?))
+    };
+    if cmd == "attest package" {
+        let mut digests = std::collections::BTreeMap::new();
+        for (name, path) in &outputs {
+            digests.insert(name.clone(), hash(path)?);
+        }
+        let st = PackageStatement::new(
+            Package {
+                target: need(&single, "target")?.to_string(),
+                repository: need(&single, "repository")?.to_string(),
+                commit: need(&single, "commit")?.to_string(),
+            },
+            digests,
+        );
+        st.check()?;
+        let payload = hartland::package::statement_bytes(&st);
+        let token = hartland::github::request_token(&hartland::attest::audience_for(&payload))?;
+        write_json(need(&single, "out")?, &Envelope::new(&payload, token))?;
+        eprintln!("attested {} ({} outputs)", st.predicate.target, st.subject.len());
+        return Ok(());
+    }
+    let env: Envelope = read_json(need(&single, "envelope")?)?;
+    let keyring: Keyring = read_json(need(&single, "keyring")?)?;
+    let jwks: Jwks = read_json(need(&single, "jwks")?)?;
+    let (st, signer) = hartland::package::verify(&env, &jwks, &keyring)?;
+    for (name, path) in &outputs {
+        let want = st.digest_of(name).ok_or_else(|| format!("{name} is not an attested output of {}", st.predicate.target))?;
+        let got = hash(path)?;
+        if got != want {
+            return Err(format!("{path} does not match the attested {name}: {got} != {want}"));
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"package": st.predicate, "outputs": st.subject, "signer": signer, "files_checked": outputs.len()}))
+            .map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+
 fn report_publish(r: Result<Result<usize, String>, tokio::task::JoinError>) {
     match r {
         Ok(Ok(0)) => {}
@@ -276,6 +335,7 @@ fn run(args: &[String]) -> Result<(), String> {
         _ => return Err(USAGE.to_string()),
     };
     match cmd.as_str() {
+        "attest package" | "attest verify-package" => return package_cmd(&cmd, rest),
         "sandbox setup" => return hartland::sandbox::setup(),
         "sandbox run" => return sandbox_run(rest),
         "oci probe" => return oci_probe(&flags(rest)?),
