@@ -27,7 +27,7 @@ jobs:
           mkdir -p results
           exec > >(tee results/ghcr-log.txt) 2>&1
           src/cli/target/release/hartland oci probe --registry ghcr.io --repo nhawkes/hartland-spike-cache \
-            --count 300 --salt "$GITHUB_RUN_ID" > results/ghcr.json
+            --count 300 --parallel 16 --salt "$GITHUB_RUN_ID" > results/ghcr.json
           cat results/ghcr.json
         env:
           REGISTRY_USER: ${{ github.actor }}
