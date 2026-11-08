@@ -5,6 +5,8 @@ pub mod github;
 pub mod jwt;
 pub mod keyring;
 pub mod oci;
+pub mod proxy;
+pub mod reapi;
 pub mod sandbox;
 
 use attest::{Envelope, SIGNATURE_KIND, Statement};

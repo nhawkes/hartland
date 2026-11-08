@@ -72,6 +72,12 @@ impl Registry {
         Ok(r.body)
     }
 
+    /// The blob GET response itself, without following a redirect.
+    pub fn get_blob_raw(&self, hash: &str) -> Result<Reply, String> {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
+        self.auth(agent.get(&format!("{}/blobs/sha256:{hash}", self.base))).go()
+    }
+
     /// Uploads a blob (monolithic POST then PUT). Returns its sha256 hex.
     pub fn put_blob(&self, data: &[u8]) -> Result<String, String> {
         let hash = sha256_hex(data);

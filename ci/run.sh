@@ -14,7 +14,9 @@ export PATH
 
 flags=()
 if [ -n "${BUILDBUDDY_API_KEY:-}" ]; then
-    flags+=("@mode/remote")
+    # The RE client is configured at daemon start from project config files.
+    cp mode/remote.bcfg .buckconfig.local
+    buck2 kill >/dev/null 2>&1 || true
     echo "ci: BuildBuddy remote execution" >&2
 else
     echo "ci: BUILDBUDDY_API_KEY not set; building locally" >&2
