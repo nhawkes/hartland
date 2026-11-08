@@ -345,6 +345,12 @@ impl GhcrStore {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
+        let env_digest = format!("sha256:{}", envelope.0);
+        let bundle_digest = format!("sha256:{}", bundle.0);
+        let digest_at = |i: usize, layers: &Vec<serde_json::Value>| layers.get(i).and_then(|l| l.get("digest")).and_then(|d| d.as_str()).map(str::to_string);
+        if (0..layers.len()).any(|i| digest_at(i, &layers).as_deref() == Some(env_digest.as_str()) && digest_at(i + 1, &layers).as_deref() == Some(bundle_digest.as_str())) {
+            return Ok(()); // already indexed
+        }
         layers.push(serde_json::json!({"mediaType": ENVELOPE_MEDIA_TYPE, "digest": format!("sha256:{}", envelope.0), "size": envelope.1}));
         layers.push(serde_json::json!({"mediaType": BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{}", bundle.0), "size": bundle.1}));
         let keep = INDEX_MAX_BATCHES * 2;
@@ -434,7 +440,12 @@ impl GhcrStore {
                 // First-tier results reused this run, under their own envelopes.
                 let reused: Vec<String> = std::mem::take(&mut *lock(&self.reused)).into_iter().collect();
                 let mut by_env: HashMap<String, Vec<String>> = HashMap::new();
-                for a in reused {
+                let registry = lock(&self.registry_origin).clone();
+                let skipped = reused.iter().filter(|a| registry.contains_key(*a)).count();
+                if skipped > 0 {
+                    tracing::info!(results = skipped, "reused results already in a registry index: not promoted");
+                }
+                for a in reused.into_iter().filter(|a| !registry.contains_key(a)) {
                     if let Some(env) = lock(&self.l1_origin).get(&a).cloned() {
                         by_env.entry(env).or_default().push(a);
                     }

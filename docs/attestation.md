@@ -153,6 +153,13 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
   original envelopes; phase 2 loaded 1364 verified results from the index
   and rebuilt at 100% cache hits in ~9 s (was 7 min).
 
+- Two-tier cache (builder 7e6b733): the Actions cache restored 3 signed
+  batches; the proxy verified all 1364 results from them, no per-action
+  registry lookups, and rebuilt at 100% cache hits. That run also
+  re-promoted all 1364 to GHCR although its index already held them; reused
+  results already in a registry index are now skipped, and a batch is never
+  indexed twice.
+
 - Package attestations (hartland-packages run 42492602972, builder
   1bc0a13): one statement per target, subjects = output files by sha256,
   predicate = target, repository, commit; verification requires repository
