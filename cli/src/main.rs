@@ -95,6 +95,100 @@ fn sandbox_run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Spike: how well does a registry (GHCR) work as an action cache?
+/// Credentials come from REGISTRY_USER / REGISTRY_PASSWORD.
+fn oci_probe(f: &HashMap<String, String>) -> Result<(), String> {
+    use hartland::attest::sha256_hex;
+    use hartland::oci::{MANIFEST_MEDIA_TYPE, Registry};
+    use serde_json::json;
+    use std::time::Instant;
+
+    let host = need(f, "registry")?;
+    let repo = need(f, "repo")?;
+    let count: usize = need(f, "count")?.parse().map_err(|e| format!("--count: {e}"))?;
+    let salt = f.get("salt").cloned().unwrap_or_default();
+    let user = std::env::var("REGISTRY_USER").map_err(|_| "REGISTRY_USER not set")?;
+    let pass = std::env::var("REGISTRY_PASSWORD").map_err(|_| "REGISTRY_PASSWORD not set")?;
+    let mut report = serde_json::Map::new();
+
+    let anon = Registry::new(host, repo);
+    let mut reg = Registry::new(host, repo);
+    reg.login(host, &user, &pass)?;
+
+    // 1. Many small blobs.
+    let start = Instant::now();
+    let mut hashes = Vec::new();
+    let mut failures = Vec::new();
+    for i in 0..count {
+        match reg.put_blob(format!("hartland probe blob {salt} {i}").as_bytes()) {
+            Ok(h) => hashes.push(h),
+            Err(e) => failures.push(e),
+        }
+    }
+    let ms = start.elapsed().as_millis();
+    report.insert("blobs_pushed".into(), json!(hashes.len()));
+    report.insert("blob_failures".into(), json!(failures.iter().take(5).collect::<Vec<_>>()));
+    report.insert("blob_push_ms_total".into(), json!(ms));
+    report.insert("blob_push_ms_each".into(), json!(ms as f64 / count.max(1) as f64));
+    let start = Instant::now();
+    let exists = hashes.iter().filter(|h| reg.blob_exists(h).unwrap_or(false)).count();
+    report.insert("blob_exists_ms_each".into(), json!(start.elapsed().as_millis() as f64 / hashes.len().max(1) as f64));
+    report.insert("blobs_found".into(), json!(exists));
+    if let Some(h) = hashes.first() {
+        report.insert("blob_roundtrip_ok".into(), json!(reg.get_blob(h).is_ok()));
+    }
+
+    // 2. A cache entry: manifest tagged with the action digest.
+    let empty = reg.put_blob(b"{}")?;
+    let layer = |h: &String| json!({"mediaType": "application/octet-stream", "digest": format!("sha256:{h}"), "size": format!("hartland probe blob {salt} 0").len()});
+    let entry = json!({
+        "schemaVersion": 2,
+        "mediaType": MANIFEST_MEDIA_TYPE,
+        "artifactType": "application/vnd.hartland.action-result.v0",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": format!("sha256:{empty}"), "size": 2},
+        "layers": hashes.iter().take(1).map(layer).collect::<Vec<_>>(),
+    });
+    let entry_bytes = serde_json::to_vec(&entry).map_err(|e| e.to_string())?;
+    let action_tag = sha256_hex(format!("hartland probe action {salt}").as_bytes());
+    let entry_digest = reg.put_manifest(&action_tag, MANIFEST_MEDIA_TYPE, &entry_bytes)?;
+    report.insert("entry_digest".into(), json!(entry_digest));
+    let got = reg.get_manifest(&action_tag)?;
+    report.insert("entry_by_tag_status".into(), json!(got.status));
+    report.insert("entry_by_tag_same_bytes".into(), json!(got.body == entry_bytes));
+
+    // 3. A signature artifact attached via `subject`, then referrers.
+    let sig_blob = reg.put_blob(format!("probe signature {salt}").as_bytes())?;
+    let sig = json!({
+        "schemaVersion": 2,
+        "mediaType": MANIFEST_MEDIA_TYPE,
+        "artifactType": "application/vnd.hartland.attestation.v0+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": format!("sha256:{empty}"), "size": 2},
+        "layers": [{"mediaType": "application/vnd.hartland.attestation.v0+json", "digest": format!("sha256:{sig_blob}"), "size": format!("probe signature {salt}").len()}],
+        "subject": {"mediaType": MANIFEST_MEDIA_TYPE, "digest": entry_digest, "size": entry_bytes.len()},
+    });
+    let sig_bytes = serde_json::to_vec(&sig).map_err(|e| e.to_string())?;
+    let sig_digest = format!("sha256:{}", sha256_hex(&sig_bytes));
+    match reg.put_manifest(&sig_digest, MANIFEST_MEDIA_TYPE, &sig_bytes) {
+        Ok(d) => {
+            report.insert("sig_put".into(), json!(d));
+        }
+        Err(e) => {
+            report.insert("sig_put_error".into(), json!(e));
+        }
+    }
+    let refs = reg.referrers(&entry_digest)?;
+    report.insert("referrers_status".into(), json!(refs.status));
+    report.insert("referrers_body".into(), json!(String::from_utf8_lossy(&refs.body).chars().take(600).collect::<String>()));
+    let rate: Vec<_> = refs.headers.iter().filter(|(k, _)| k.to_ascii_lowercase().contains("ratelimit")).collect();
+    report.insert("ratelimit_headers".into(), json!(rate));
+
+    // 4. Anonymous read (private packages should refuse).
+    report.insert("anonymous_manifest_status".into(), json!(anon.get_manifest(&action_tag)?.status));
+
+    println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let (cmd, rest) = match args {
         [a, b, rest @ ..] => (format!("{a} {b}"), rest),
@@ -103,6 +197,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match cmd.as_str() {
         "sandbox setup" => return hartland::sandbox::setup(),
         "sandbox run" => return sandbox_run(rest),
+        "oci probe" => return oci_probe(&flags(rest)?),
         _ => {}
     }
     let f = flags(rest)?;
