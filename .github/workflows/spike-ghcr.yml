@@ -1,0 +1,45 @@
+# Spike: GHCR as an action cache. Results go to spike/ghcr-results.
+name: spike-ghcr
+on:
+  push:
+    branches: [spike/ghcr]
+permissions:
+  contents: write
+  packages: write
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Fetch this commit
+        run: |
+          git init -q src && cd src
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Build
+        run: cd src/cli && cargo build --locked --release -q
+      - name: Probe GHCR
+        if: always()
+        run: |
+          mkdir -p results
+          exec > >(tee results/ghcr-log.txt) 2>&1
+          src/cli/target/release/hartland oci probe --registry ghcr.io --repo nhawkes/hartland-spike-cache \
+            --count 300 --salt "$GITHUB_RUN_ID" > results/ghcr.json
+          cat results/ghcr.json
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
+      - name: Publish results
+        if: always()
+        run: |
+          mkdir -p results && cd results
+          git init -q && git checkout -q -b results
+          git -c user.name=spike -c user.email=spike@invalid add -A
+          git -c user.name=spike -c user.email=spike@invalid commit -qm "spike-ghcr results for $GITHUB_SHA (run $GITHUB_RUN_ID)"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" push -qf "https://github.com/$GITHUB_REPOSITORY" HEAD:refs/heads/spike/ghcr-results
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
