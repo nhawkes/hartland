@@ -1,9 +1,10 @@
 """Compiling C straight from an unpacked source tree with the seed zig.
 
-For packages whose BUCK files list sources explicitly (generated from the
-upstream build, no globs): each listed file is compiled from a projection of
-the pinned source tree, so nothing is copied into the repository and the
-prelude's C++ machinery is not involved.
+Each source is compiled from a projection of the pinned source tree, so
+nothing is copied into the repository and the prelude's C++ machinery is not
+involved. `tree_c` takes an explicit source list; packages that discover their
+sources inside the build (from a dynamic action) call the action-level helpers
+`tree_c_includes`, `tree_c_compile` and `tree_c_archive` directly.
 """
 
 TreeObjectsInfo = provider(fields = {
@@ -11,27 +12,56 @@ TreeObjectsInfo = provider(fields = {
     "objects": provider_field(dict[str, Artifact]),
 })
 
-def _obj_name(src: str) -> str:
+def tree_c_obj_name(src: str) -> str:
+    """The object name for a source path: its extension replaced by .o."""
     base = src.rsplit(".", 1)[0]
     return base + ".o"
 
 def _parent(p):
     return p.rsplit("/", 1)[0] if "/" in p else ""
 
-def _compile(ctx, zig, tree, src, flags, includes, hidden):
-    out = ctx.actions.declare_output("obj", _obj_name(src))
-    if ctx.attrs.input_dirs:
-        # Only the header directories, the source's own directory and (for
-        # arch subdirectories) its parent: far smaller remote inputs.
+def tree_c_includes(tree: Artifact, gen: [Artifact, None], include_dirs: list[str]) -> list[cmd_args]:
+    """-I flags for one ordered list of "tree:<dir>" (inside the source tree)
+    and "gen:<dir>" (inside the `gen` directory) entries. Order matters: it
+    decides which header wins."""
+    includes = []
+    for inc in include_dirs:
+        kind, _, path = inc.partition(":")
+        if kind == "tree":
+            base = tree
+        elif kind == "gen" and gen:
+            base = gen
+        else:
+            fail("include_dirs entries are tree:<dir> or gen:<dir> (with `generated`), got " + inc)
+        includes.append(cmd_args(base.project(path) if path else base, format = "-I{}"))
+    return includes
+
+def tree_c_compile(
+        actions: AnalysisActions,
+        zig: typing.Any,
+        tree: Artifact,
+        src: str,
+        flags: list[str],
+        includes: list[cmd_args],
+        hidden: list[Artifact],
+        target: str,
+        input_dirs: list[str]) -> Artifact:
+    """Compiles `src` (a path inside `tree`) to obj/<src stem>.o. `hidden` is
+    the tree plus any generated header directory. With `input_dirs`, the
+    action gets only those tree directories, the source's own directory and
+    (for arch subdirectories) its parent instead of the whole tree: far
+    smaller remote inputs."""
+    out = actions.declare_output("obj", tree_c_obj_name(src))
+    if input_dirs:
         d = _parent(src)
-        dirs = {x: None for x in list(ctx.attrs.input_dirs) + [d, _parent(d)] if x}
+        dirs = {x: None for x in list(input_dirs) + [d, _parent(d)] if x}
         hidden = [h for h in hidden if h != tree] + [tree.project(x) for x in dirs]
-    ctx.actions.run(
+    actions.run(
         cmd_args(
             zig,
             "cc",
             "-target",
-            ctx.attrs.target,
+            target,
             "-c",
             tree.project(src),
             "-o",
@@ -45,39 +75,30 @@ def _compile(ctx, zig, tree, src, flags, includes, hidden):
     )
     return out
 
+def tree_c_archive(actions: AnalysisActions, zig: typing.Any, out: OutputArtifact, name: str, objects: dict[str, Artifact]):
+    """Archives `objects` into `out`, members in sorted name order."""
+    argsfile = actions.write("{}.objects".format(name), [objects[k] for k in sorted(objects)])
+    actions.run(
+        cmd_args(zig, "ar", "rcs", out, cmd_args(argsfile, format = "@{}"), hidden = objects.values()),
+        category = "ar",
+    )
+
 def _tree_c_impl(ctx: AnalysisContext) -> list[Provider]:
     zig = ctx.attrs._zig[RunInfo]
     tree = ctx.attrs.tree[DefaultInfo].default_outputs[0]
-
-    # One ordered list: "tree:<dir>" is inside the source tree, "gen:<dir>"
-    # inside the `generated` directory. Order matters: it decides which
-    # header wins.
     gen = ctx.attrs.generated[DefaultInfo].default_outputs[0] if ctx.attrs.generated else None
-    includes = []
+    includes = tree_c_includes(tree, gen, ctx.attrs.include_dirs)
     hidden = [tree] + ([gen] if gen else [])
-    for inc in ctx.attrs.include_dirs:
-        kind, _, path = inc.partition(":")
-        if kind == "tree":
-            base = tree
-        elif kind == "gen" and gen:
-            base = gen
-        else:
-            fail("include_dirs entries are tree:<dir> or gen:<dir> (with `generated`), got " + inc)
-        includes.append(cmd_args(base.project(path) if path else base, format = "-I{}"))
 
     objects = {}
     for src in ctx.attrs.srcs:
         flags = list(ctx.attrs.cflags) + list(ctx.attrs.src_flags.get(src, []))
-        objects[_obj_name(src)] = _compile(ctx, zig, tree, src, flags, includes, hidden)
+        objects[tree_c_obj_name(src)] = tree_c_compile(ctx.actions, zig, tree, src, flags, includes, hidden, ctx.attrs.target, ctx.attrs.input_dirs)
 
     providers = [TreeObjectsInfo(objects = objects)]
     if ctx.attrs.archive:
         lib = ctx.actions.declare_output(ctx.attrs.archive)
-        argsfile = ctx.actions.write("{}.objects".format(ctx.attrs.archive), [objects[k] for k in sorted(objects)])
-        ctx.actions.run(
-            cmd_args(zig, "ar", "rcs", lib.as_output(), cmd_args(argsfile, format = "@{}"), hidden = objects.values()),
-            category = "ar",
-        )
+        tree_c_archive(ctx.actions, zig, lib.as_output(), ctx.attrs.archive, objects)
         providers.append(DefaultInfo(default_output = lib, sub_targets = {
             k: [DefaultInfo(default_output = v)]
             for k, v in objects.items()
