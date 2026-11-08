@@ -1,0 +1,126 @@
+"""Targets affected by a set of changed files, for CI.
+
+    buck2 bxl hartland//ci/affected.bxl:affected -- --file a/b.c --file hartland/rules/sh.bzl
+
+Prints one configured-target label per line: every target labelled `ci` (by
+default) that is, or transitively depends on, a target touched by the change.
+
+How a changed path seeds the search (paths are relative to the project root):
+  * a BUCK file: every target it defines;
+  * a .bzl / .bxl file: every target in every BUCK file that loads it, transitively;
+  * any other file: its owning targets.
+A file no target owns cannot affect any build (buck2 declares every input), so
+it selects nothing. Anything we cannot attribute safely selects every `ci`
+target instead: a deleted path (its old owner may still reference it) or
+project-wide configuration (.buckconfig, .buckroot, PACKAGE files, mode and
+platform files). Over-building is cheap with a warm cache; under-building is a
+silent hole.
+
+Seeds are matched by unconfigured label in every configuration, so changes to
+tools built for the execution platform (zig-wrap, busybox) reach their users.
+"""
+
+_GLOBAL_BASENAMES = [".buckconfig", ".buckroot", "PACKAGE", "BUCK_TREE"]
+_GLOBAL_PREFIXES = ["mode/", "platforms/"]
+
+def _basename(p):
+    return p.split("/")[-1]
+
+def _cell_path(roots, project_root, path):
+    """`hartland/rules/sh.bzl` -> `hartland//rules/sh.bzl`, by longest cell root."""
+    abs = project_root + "/" + path
+    best = None
+    for cell, root in roots.items():
+        if abs == root or abs.startswith(root + "/"):
+            if best == None or len(root) > len(roots[best]):
+                best = cell
+    if best == None:
+        return None
+    rel = abs[len(roots[best]) + 1:] if abs != roots[best] else ""
+    return best + "//" + rel
+
+def _impl(ctx):
+    files = ctx.cli_args.file or []
+    label = ctx.cli_args.label
+    # Canonical cell names only: aliases (root) would not match query results.
+    cells = ctx.cli_args.cell or ["packages", "toolchains", "hartland"]
+    project_root = ctx.root()
+    all_roots = ctx.audit().cell(aliases = True)
+    roots = {c: all_roots[c] for c in cells}
+
+    q = ctx.uquery()
+    universe = q.eval("set({}) - set(hartland//lint/fixtures/...)".format(
+        " ".join([c + "//..." for c in cells]),
+    ))
+    buildfiles = q.buildfile(universe)
+    buildfile_names = {str(f): None for f in buildfiles}
+
+    everything = False
+    reasons = []
+    seeds = []
+    load_files = []
+    owner_files = []
+    for f in files:
+        if not f:
+            continue
+        if _basename(f) in _GLOBAL_BASENAMES or [p for p in _GLOBAL_PREFIXES if f.startswith(p)]:
+            everything = True
+            reasons.append("global: " + f)
+            continue
+        cp = _cell_path(roots, project_root, f)
+        if cp == None:
+            # Outside every scanned cell (e.g. CI scripts, docs): builds nothing.
+            continue
+        if not ctx.fs.exists(cp):
+            everything = True
+            reasons.append("deleted: " + f)
+            continue
+        if cp in buildfile_names:
+            seeds.extend(q.targets_in_buildfile([cp]))
+        elif f.endswith(".bzl") or f.endswith(".bxl"):
+            load_files.append(cp)
+        else:
+            owner_files.append(cp)
+
+    if load_files:
+        loaded_by = q.rbuildfiles(buildfiles, load_files)
+        keep = [str(b) for b in loaded_by if str(b) in buildfile_names]
+        if keep:
+            seeds.extend(q.targets_in_buildfile(keep))
+
+    if owner_files:
+        owned = q.owner(owner_files)
+        for t in owned:
+            seeds.append(t)
+        owned_paths = {}
+        for t in owned:
+            owned_paths[str(t.label)] = None
+        if not owned_paths:
+            reasons.append("unowned, ignored: " + ", ".join(owner_files))
+
+    universe_cfg = ctx.configured_targets(universe)
+    if everything:
+        affected = universe_cfg
+    elif seeds:
+        # Find every configuration each seed appears in (target or exec).
+        wanted = {str(t.label): None for t in seeds}
+        closure = ctx.cquery().deps(universe_cfg)
+        configured_seeds = [t for t in closure if str(t.label.raw_target()) in wanted]
+        affected = ctx.cquery().rdeps(universe_cfg, configured_seeds) if configured_seeds else []
+    else:
+        affected = []
+
+    chosen = ctx.cquery().attrfilter("labels", label, affected) if affected else []
+    for r in reasons:
+        ctx.output.print("# " + r)
+    for t in chosen:
+        ctx.output.print(str(t.label.raw_target()))
+
+affected = bxl_main(
+    impl = _impl,
+    cli_args = {
+        "cell": cli_args.option(cli_args.list(cli_args.string()), doc = "Canonical cells to scan (default: packages, toolchains, hartland)."),
+        "file": cli_args.option(cli_args.list(cli_args.string()), doc = "Changed path, relative to the project root. Repeatable."),
+        "label": cli_args.string(default = "ci", doc = "Only report targets carrying this label."),
+    },
+)
