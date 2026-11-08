@@ -83,3 +83,32 @@ sh_genrule = rule(
         "_sh": attrs.default_only(attrs.exec_dep(default = "toolchains//:sh", providers = [ShellInfo])),
     },
 )
+
+def _program_test_impl(ctx: AnalysisContext) -> list[Provider]:
+    exe = ctx.attrs.program[DefaultInfo].default_outputs[0]
+    out = ctx.actions.declare_output(ctx.label.name + ".log")
+    script = """
+"$PWD/$PROGRAM" {args} > "$OUT" 2>&1 || {{ rc=$?; cat "$OUT" >&2; echo "test failed with exit status $rc" >&2; exit 1; }}
+""".format(args = " ".join(['"{}"'.format(a) for a in ctx.attrs.args]))
+    sh_action(
+        ctx,
+        ctx.attrs._sh[ShellInfo],
+        script,
+        env = {"OUT": out.as_output(), "PROGRAM": cmd_args(exe)},
+        hidden = [exe],
+        category = "program_test",
+    )
+    return [DefaultInfo(default_output = out)]
+
+# A test as a build action: runs `program` in the action sandbox and fails the
+# build if it exits non-zero. Its log is an ordinary output, so attested
+# builds execute, cache and sign test results like everything else.
+program_test = rule(
+    impl = _program_test_impl,
+    attrs = {
+        "args": attrs.list(attrs.string(), default = []),
+        "labels": attrs.list(attrs.string(), default = []),
+        "program": attrs.dep(),
+        "_sh": attrs.default_only(attrs.exec_dep(default = "toolchains//:sh", providers = [ShellInfo])),
+    },
+)
