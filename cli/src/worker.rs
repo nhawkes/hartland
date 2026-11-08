@@ -195,6 +195,31 @@ pub async fn bind(identity: &Identity, network: Network) -> Result<Endpoint, Pee
     Ok(ep)
 }
 
+/// The path a connection uses right now: direct UDP, or n0's relay.
+fn path(conn: &Connection) -> (&'static str, Option<Duration>) {
+    match conn.paths().iter().find(|p| p.is_selected()) {
+        Some(p) if p.is_ip() => ("direct", Some(p.rtt())),
+        Some(p) => ("relay", Some(p.rtt())),
+        None => ("none", None),
+    }
+}
+
+/// Waits up to `limit` for a direct path. Bulk transfers wait for it: the
+/// public relays rate-limit, and NAT traversal usually succeeds within a
+/// second.
+async fn await_direct(conn: &Connection, limit: Duration) -> &'static str {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if path(conn).0 == "direct" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (kind, rtt) = path(conn);
+    tracing::info!(path = kind, ?rtt, waited = ?started.elapsed(), "connection path");
+    kind
+}
+
 /// What both sides require of each other.
 pub struct PeerTrust {
     pub keyring: Keyring,
@@ -389,6 +414,17 @@ impl Pool {
                 match pool.admit(&conn, &key).await {
                     Ok(slots) => {
                         tracing::info!(worker = %key, slots, "worker joined");
+                        {
+                            // Record how the path settles: direct, or relayed.
+                            let conn = conn.clone();
+                            tokio::spawn(async move {
+                                for after in [Duration::from_secs(5), Duration::from_secs(60)] {
+                                    tokio::time::sleep(after).await;
+                                    let (kind, rtt) = path(&conn);
+                                    tracing::info!(worker = %key, path = kind, ?rtt, "worker path");
+                                }
+                            });
+                        }
                         pool.members.pin().insert(
                             key,
                             Arc::new(Member {
@@ -723,6 +759,9 @@ pub async fn run_worker(
                 )));
             }
             tracing::info!(coordinator = %coordinator, run = %signer.run_id, "joined");
+            // Before taking work (and pulling thousands of input files),
+            // give NAT traversal a moment to find a direct path.
+            await_direct(&conn, Duration::from_secs(5)).await;
         }
         (Response::Refused { reason }, _) => return Err(PeerError::Refused(reason)),
         (other, _) => return Err(PeerError::Protocol(format!("unexpected {other:?}"))),
