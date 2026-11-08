@@ -137,6 +137,18 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
 
 ## Settled
 
+- musl from source, attested (hartland-packages run on builder 14230f3,
+  2-core runner): first build 1357/1364 actions executed in the sandbox
+  (8.5 min), 1357 signed results published; fresh-proxy rebuild 100% cache
+  hits (1364/1364) but 7 min, since each hit costs several registry requests
+  (manifest, config, output blobs). Package attestations signed for
+  hello-own-musl and the libc smoke test (run as a sandboxed build action).
+- GHCR rate limit: 2000 requests/minute, answered with 429 TOOMANYREQUESTS
+  and `retry-after` in the body. An earlier run lost 284 manifests to it;
+  the client now paces at 30 requests/s and retries.
+- Next: one signed index per batch (action -> result) so readers fetch one
+  index instead of a manifest per action, and pack small outputs.
+
 - Package attestations (hartland-packages run 42492602972, builder
   1bc0a13): one statement per target, subjects = output files by sha256,
   predicate = target, repository, commit; verification requires repository
