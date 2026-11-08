@@ -122,11 +122,17 @@ ordered by buck2's dependency graph, local execution plus the verified cache.
 - Alternative: `sysctl kernel.apparmor_restrict_unprivileged_userns=0`, then
   `bwrap --unshare-all` as the sandbox uid, also works.
 - Private-repo runners: 2 cores, 7 GB RAM, ~14 GB free disk.
+- Called from hartland-packages, a reusable workflow in hartland pinned by
+  commit gets a token with `job_workflow_ref =
+  nhawkes/hartland/.github/workflows/<file>@<commit>` and `job_workflow_sha`
+  equal to that commit, while `repository`, `workflow_ref` and `sha` name the
+  caller. So the verifier pins the builder by `job_workflow_ref` +
+  `job_workflow_sha` + `runner_environment`, independent of who called it.
+  (Private repositories need hartland's Actions "Access" setting to allow
+  repositories owned by the user.)
 
 ## Open questions
 
-1. Reusable workflow: confirm `job_workflow_ref` names the called workflow
-   when invoked from another repository.
-2. GHCR: referrers API, rate limits, behaviour with many small blobs.
-3. buck2 executor settings for local execution with a remote cache.
-4. Actions concurrency limits and terms of use for long-lived worker jobs.
+1. GHCR: referrers API, rate limits, behaviour with many small blobs.
+2. buck2 executor settings for local execution with a remote cache.
+3. Actions concurrency limits and terms of use for long-lived worker jobs.
