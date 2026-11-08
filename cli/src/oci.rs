@@ -84,12 +84,18 @@ where
                 if g.is_some_and(|t| t > received) {
                     continue; // another request's probe came back clean since
                 }
-                tokio::time::sleep_until(received + retry_after(&r).unwrap_or(backoff)).await;
+                let wait = retry_after(&r).unwrap_or(backoff);
+                tracing::debug!(?wait, attempt, "429: gate closed, backing off");
+                tokio::time::sleep_until(received + wait).await;
                 held = Some(g); // probe while holding
             }
             Ok((r, _)) => {
+                if held.is_some() {
+                    tracing::debug!(status = r.status, "probe clean, gate reopened");
+                }
                 reopen(&mut held);
                 if (500..600).contains(&r.status) {
+                    tracing::warn!(status = r.status, attempt, "server error, retrying");
                     last = format!("{} {}", r.status, String::from_utf8_lossy(&r.body));
                     tokio::time::sleep(backoff).await;
                     continue;
@@ -98,6 +104,7 @@ where
             }
             Err(e) => {
                 // No reply: a held gate stays held for the next probe.
+                tracing::warn!(error = %e, attempt, "transport error, retrying");
                 last = e;
                 tokio::time::sleep(backoff).await;
             }

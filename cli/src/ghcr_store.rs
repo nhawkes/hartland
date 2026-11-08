@@ -166,7 +166,7 @@ impl GhcrStore {
             for v in l1.load(&self.jwks, &self.keyring).await {
                 self.accept_batch(v, true);
             }
-            eprintln!("hartland proxy: first tier: {} verified result(s)", lock(&self.indexed).len());
+            tracing::info!(results = lock(&self.indexed).len(), "first tier loaded");
         }
         for reg in &self.readers {
             let Ok(reply) = reg.get_manifest(INDEX_TAG).await else { continue };
@@ -404,7 +404,7 @@ impl GhcrStore {
             let env_hash = sha256_hex(&envelope);
             self.save_l1(&env_hash, &envelope, &entries).await?;
             if self.l1.is_some() {
-                eprintln!("hartland proxy: first tier: saved {} new result(s)", entries.len());
+                tracing::info!(results = entries.len(), batch = %env_hash, "first tier: saved new results");
             }
             new_batch = Some((env_hash, envelope, entries));
         }
@@ -422,7 +422,7 @@ impl GhcrStore {
                 let bundle = l1::bundle_bytes(&entries)?;
                 let bundle_hash = writer.put_blob(&bundle).await?;
                 self.append_index(writer, (&env_hash, envelope.len()), (&bundle_hash, bundle.len())).await?;
-                eprintln!("hartland proxy: indexed {} previously signed result(s)", entries.len());
+                tracing::info!(results = entries.len(), batch = %env_hash, "indexed previously signed results");
             }
 
             if self.promote == Promote::All {
@@ -448,7 +448,7 @@ impl GhcrStore {
                         entries.push((a, r, blobs));
                     }
                     self.push_batch(writer, &env_hash, &envelope, &entries).await?;
-                    eprintln!("hartland proxy: promoted {} reused result(s) to the registry", entries.len());
+                    tracing::info!(results = entries.len(), batch = %env_hash, "promoted reused results to the registry");
                 }
             }
         }
@@ -476,7 +476,7 @@ impl GhcrStore {
                 results += entries.len();
             }
             if results > 0 {
-                eprintln!("hartland proxy: first tier: wrote through {results} registry result(s) in {batches} batch(es)");
+                tracing::info!(results, batches, "first tier: wrote through registry results");
             }
         }
         if let Some(l1) = &self.l1 {

@@ -33,11 +33,19 @@ const USAGE: &str = "usage:
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Logs to stderr; RUST_LOG overrides (e.g. RUST_LOG=hartland=debug).
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("hartland: {e}");
+            tracing::error!("{e}");
             ExitCode::FAILURE
         }
     }
@@ -112,7 +120,7 @@ async fn attest_sign(f: &HashMap<String, String>) -> Result<(), String> {
     let payload = hartland::statement_bytes(&statement);
     let token = hartland::github::request_token(&hartland::attest::audience_for(&payload)).await?;
     write_json(need(f, "out")?, &Envelope::new(&payload, token)).await?;
-    eprintln!("signed {} results", statement.predicate.results.len());
+    tracing::info!(results = statement.predicate.results.len(), "signed");
     Ok(())
 }
 
@@ -159,7 +167,7 @@ async fn package_cmd(cmd: &str, args: &[String]) -> Result<(), String> {
         let payload = hartland::package::statement_bytes(&st);
         let token = hartland::github::request_token(&hartland::attest::audience_for(&payload)).await?;
         write_json(need(&single, "out")?, &Envelope::new(&payload, token)).await?;
-        eprintln!("attested {} ({} outputs)", st.predicate.target, st.subject.len());
+        tracing::info!(target = %st.predicate.target, outputs = st.subject.len(), "attested package");
         return Ok(());
     }
     let env: Envelope = read_json(need(&single, "envelope")?).await?;
@@ -181,7 +189,7 @@ async fn jwks_update(f: &HashMap<String, String>) -> Result<(), String> {
     let mut archive: Jwks = if tokio::fs::try_exists(path).await.unwrap_or(false) { read_json(path).await? } else { Jwks::default() };
     let added = archive.merge(&hartland::github::fetch_jwks().await?)?;
     write_json(path, &archive).await?;
-    eprintln!("{added} new key(s); {} in archive", archive.keys.len());
+    tracing::info!(added, archived = archive.keys.len(), "jwks updated");
     Ok(())
 }
 
@@ -256,7 +264,7 @@ async fn with_execution(
         use std::os::unix::fs::PermissionsExt as _;
         tokio::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).await.map_err(|e| e.to_string())?;
     }
-    eprintln!("hartland proxy: remote execution enabled ({})", if drop_user { "sandbox uid" } else { "unprivileged" });
+    tracing::info!(sandbox = if drop_user { "uid" } else { "unprivileged" }, "remote execution enabled");
     Ok(proxy.with_executor(hartland::execute::Executor::new(store, drop_user, scratch)))
 }
 
@@ -297,8 +305,8 @@ async fn ghcr_store(f: &HashMap<String, String>, disk: hartland::proxy::DiskStor
 fn report_publish(r: Result<usize, String>) {
     match r {
         Ok(0) => {}
-        Ok(n) => eprintln!("hartland proxy: published {n} signed result(s)"),
-        Err(e) => eprintln!("hartland proxy: publish failed: {e}"),
+        Ok(n) => tracing::info!(results = n, "published signed results"),
+        Err(e) => tracing::error!(error = %e, "publish failed"),
     }
 }
 
@@ -306,15 +314,15 @@ async fn proxy_serve(f: &HashMap<String, String>) -> Result<(), String> {
     let disk = hartland::proxy::DiskStore::new(need(f, "dir")?.into()).await?;
     let addr: std::net::SocketAddr = need(f, "listen")?.parse().map_err(|e| format!("--listen: {e}"))?;
     if f.get("registry").is_none() {
-        eprintln!("hartland proxy (disk) listening on {addr}");
+        tracing::info!(%addr, store = "disk", "listening");
         let store: Arc<dyn hartland::proxy::Store> = Arc::new(disk);
         return with_execution(f, hartland::proxy::Proxy::new(store.clone()), store).await?.serve(addr).await;
     }
     let store = Arc::new(ghcr_store(f, disk).await?);
     let loaded = store.load().await;
-    eprintln!("hartland proxy: {loaded} verified result(s) available from the first tier and registry indexes");
+    tracing::info!(results = loaded, "verified results available (first tier + registry indexes)");
     let every: u64 = f.get("publish-every").map(|s| s.parse()).transpose().map_err(|e| format!("--publish-every: {e}"))?.unwrap_or(300);
-    eprintln!("hartland proxy (registry) listening on {addr}");
+    tracing::info!(%addr, store = "registry", "listening");
     let dyn_store: Arc<dyn hartland::proxy::Store> = store.clone();
     let serve = with_execution(f, hartland::proxy::Proxy::new(dyn_store.clone()), dyn_store).await?.serve(addr);
     let periodic = {
@@ -335,7 +343,7 @@ async fn proxy_serve(f: &HashMap<String, String>) -> Result<(), String> {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
     }
-    eprintln!("hartland proxy: shutting down; publishing pending results");
+    tracing::info!("shutting down; publishing pending results");
     report_publish(store.publish().await);
     Ok(())
 }
