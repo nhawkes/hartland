@@ -371,6 +371,17 @@ def _clang_cc_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
             cmd_args(ctx.attrs.sysroot[DefaultInfo].default_outputs[0], format = "--sysroot={}"),
             "-rtlib=compiler-rt",
         ]
+    cxx_flags = []
+    if ctx.attrs.cxx_headers:
+        # Our libc++ in place of a toolchain-bundled one: its headers ahead
+        # of the libc's (-isystem precedes the system directories), its
+        # archives on every link (lld resolves archives in any order).
+        headers = ctx.attrs.cxx_headers[DefaultInfo].default_outputs[0]
+        cxx_flags = [
+            "-nostdinc++",
+            cmd_args(headers.project("include/c++/v1"), format = "-isystem{}"),
+            "-nostdlib++",
+        ] + [cmd_args(d[DefaultInfo].default_outputs[0], format = "-Wl,{}") for d in ctx.attrs.cxx_libs]
     resource_dir = ctx.actions.symlinked_dir("resource", resource)
     # The link flags are unused in compiles, which -Werror would reject.
     driver = cmd_args(
@@ -384,9 +395,15 @@ def _clang_cc_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
         DefaultInfo(),
         CcToolchainInfo(
             cc = driver,
-            # Until the stage builds its own libc++, C++ is the C driver's
-            # (callers bring -nostdinc++ and the library).
-            cxx = cmd_args(driver, "--driver-mode=g++"),
+            # Without cxx_headers, callers bring -nostdinc++ and a library
+            # (the runtimes themselves are built this way).
+            cxx = cmd_args(
+                driver,
+                "--driver-mode=g++",
+                "--start-no-unused-arguments",
+                cxx_flags,
+                "--end-no-unused-arguments",
+            ) if cxx_flags else cmd_args(driver, "--driver-mode=g++"),
             ar = cmd_args(ctx.attrs.ar[RunInfo]),
             env = {},
             runtime = [rt["builtins"]] if ctx.attrs.sysroot else [],
@@ -406,6 +423,10 @@ clang_cc_toolchain = rule(
         "clang": attrs.exec_dep(providers = [RunInfo]),
         # builtins, crtbegin, crtend -> artifacts (compiler-rt's outputs).
         "compiler_rt": attrs.dict(attrs.string(), attrs.source(), default = {}),
+        # The C++ standard library: an installed header tree (include/c++/v1)
+        # and its archives (libc++, libc++abi, libunwind).
+        "cxx_headers": attrs.option(attrs.dep(), default = None),
+        "cxx_libs": attrs.list(attrs.dep(), default = []),
         "lld": attrs.exec_dep(providers = [RunInfo]),
         "resource_headers": attrs.dep(),
         "sysroot": attrs.option(attrs.dep(), default = None),
