@@ -7,7 +7,9 @@ dynamic action reads each template from the unpacked tree and expands it:
 
   #cmakedefine VAR rest     -> #define VAR rest     or  /* #undef VAR */
   #cmakedefine01 VAR        -> #define VAR 1        or  #define VAR 0
-  ${VAR} and @VAR@          -> the value (only @VAR@ with at_only)
+  ${VAR} and @VAR@          -> the value (only @VAR@ with at_only; as
+                               with configure_file(@ONLY), #cmakedefine
+                               lines are still processed)
 A value may also be a file's contents (`file_values`: CMake's file(READ ...)
 into a variable), read from the tree in the same dynamic action.
 
@@ -87,7 +89,7 @@ def cmake_configure(text: str, values: dict[str, str], at_only: bool = False, te
     """Expands one template the way configure_file() does."""
     lines = []
     for line in text.split("\n"):
-        d = None if at_only else _directive(line)
+        d = _directive(line)
         if d == None:
             lines.append(_expand(line, values, at_only, template))
             continue
@@ -103,7 +105,7 @@ def cmake_configure(text: str, values: dict[str, str], at_only: bool = False, te
         if kind == "cmakedefine01":
             lines.append("{}define {} {}".format(indent, var, "1" if on else "0"))
         elif on:
-            lines.append("{}define {}{}".format(indent, var, _expand(tail, values, False, template)))
+            lines.append("{}define {}{}".format(indent, var, _expand(tail, values, at_only, template)))
         else:
             lines.append("/* #undef {} */".format(var))
     return "\n".join(lines)
