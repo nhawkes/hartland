@@ -53,6 +53,9 @@ CcToolchainInfo = provider(fields = {
     "ar": provider_field(cmd_args),
     # Environment for every compile and link (zig: the libc it uses).
     "env": provider_field(dict[str, typing.Any]),
+    # The compiler's runtime library, which a -nostdlib link names itself
+    # after libc (zig links its own regardless).
+    "runtime": provider_field(list[Artifact]),
 })
 
 def _zig_cc_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
@@ -65,6 +68,7 @@ def _zig_cc_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
             cxx = cmd_args(zig, "c++"),
             ar = cmd_args(zig, "ar"),
             env = env,
+            runtime = [],
         ),
     ]
 
@@ -308,6 +312,7 @@ def sysroot_c_link(
             lib.project("crti.o"),
             objects,
             lib.project("libc.a"),
+            cc.runtime,
             lib.project("crtn.o"),
             ldflags,
             "-o",
@@ -341,7 +346,7 @@ sysroot_c_binary = rule(
         "srcs": attrs.list(attrs.source()),
         "sysroot": attrs.dep(),
         "target": attrs.string(default = "x86_64-linux-musl"),
-        "_cc": attrs.default_only(attrs.toolchain_dep(default = "toolchains//:cc-freestanding", providers = [CcToolchainInfo])),
+        "_cc": attrs.default_only(attrs.toolchain_dep(default = "toolchains//:cc", providers = [CcToolchainInfo])),
     },
 )
 
@@ -352,22 +357,29 @@ def _clang_cc_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
     # per-target runtime directory (LLVM_ENABLE_PER_TARGET_RUNTIME_DIR, the
     # Linux default) with compiler-rt's builtins and crt objects.
     resource = {"include": ctx.attrs.resource_headers[DefaultInfo].default_outputs[0]}
-    flags = []
+    # Every link uses our lld, which picks its flavour from argv[0]: the
+    # driver runs it as ld.lld.
+    ld = ctx.actions.symlinked_dir("ld", {"ld.lld": ctx.attrs.lld[DefaultInfo].default_outputs[0]})
+    flags = [cmd_args(ld.project("ld.lld"), format = "--ld-path={}")]
+    rt = ctx.attrs.compiler_rt
     if ctx.attrs.sysroot:
-        rt = ctx.attrs.compiler_rt
         lib = "lib/" + triple + "/"
         resource[lib + "libclang_rt.builtins.a"] = rt["builtins"]
         resource[lib + "clang_rt.crtbegin.o"] = rt["crtbegin"]
         resource[lib + "clang_rt.crtend.o"] = rt["crtend"]
-        # lld picks its flavour from argv[0]: the driver runs it as ld.lld.
-        ld = ctx.actions.symlinked_dir("ld", {"ld.lld": ctx.attrs.lld[DefaultInfo].default_outputs[0]})
-        flags = [
+        flags += [
             cmd_args(ctx.attrs.sysroot[DefaultInfo].default_outputs[0], format = "--sysroot={}"),
-            cmd_args(ld.project("ld.lld"), format = "--ld-path={}"),
             "-rtlib=compiler-rt",
         ]
     resource_dir = ctx.actions.symlinked_dir("resource", resource)
-    driver = cmd_args(clang, cmd_args(resource_dir, format = "-resource-dir={}"), flags)
+    # The link flags are unused in compiles, which -Werror would reject.
+    driver = cmd_args(
+        clang,
+        cmd_args(resource_dir, format = "-resource-dir={}"),
+        "--start-no-unused-arguments",
+        flags,
+        "--end-no-unused-arguments",
+    )
     return [
         DefaultInfo(),
         CcToolchainInfo(
@@ -377,6 +389,7 @@ def _clang_cc_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
             cxx = cmd_args(driver, "--driver-mode=g++"),
             ar = cmd_args(ctx.attrs.ar[RunInfo]),
             env = {},
+            runtime = [rt["builtins"]] if ctx.attrs.sysroot else [],
         ),
     ]
 
@@ -384,7 +397,8 @@ def _clang_cc_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
 # execution platform, which carries no bootstrap stage: they are always the
 # previous stage's build, so selecting this toolchain for a stage does not
 # make clang depend on itself. With `sysroot` (and `compiler_rt`) it is
-# hosted: links use our musl, lld and compiler-rt; without, freestanding.
+# hosted: links use our musl and compiler-rt; without, freestanding.
+# Links always use our lld.
 clang_cc_toolchain = rule(
     impl = _clang_cc_toolchain_impl,
     attrs = {
