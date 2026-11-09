@@ -8,6 +8,8 @@ dynamic action reads each template from the unpacked tree and expands it:
   #cmakedefine VAR rest     -> #define VAR rest     or  /* #undef VAR */
   #cmakedefine01 VAR        -> #define VAR 1        or  #define VAR 0
   ${VAR} and @VAR@          -> the value (only @VAR@ with at_only)
+A value may also be a file's contents (`file_values`: CMake's file(READ ...)
+into a variable), read from the tree in the same dynamic action.
 
 Truthiness is CMake's: "", 0, OFF, NO, FALSE, N, IGNORE, NOTFOUND and
 *-NOTFOUND are false. Unlike CMake, a variable the template uses but `values`
@@ -110,8 +112,14 @@ def _configure_impl(
         actions: AnalysisActions,
         templates: dict[str, ArtifactValue],
         values: dict[str, str],
+        file_values: dict[str, ArtifactValue],
         at_only: list[str],
         out: OutputArtifact) -> list[Provider]:
+    values = dict(values)
+    for name, f in file_values.items():
+        if name in values:
+            fail("{} is set both as a value and as a file's contents".format(name))
+        values[name] = f.read_string()
     files = {}
     for path, template in templates.items():
         text = cmake_configure(template.read_string(), values, path in at_only, path)
@@ -123,6 +131,7 @@ _configure = dynamic_actions(
     impl = _configure_impl,
     attrs = {
         "at_only": dynattrs.value(list[str]),
+        "file_values": dynattrs.dict(str, dynattrs.artifact_value()),
         "out": dynattrs.output(),
         "templates": dynattrs.dict(str, dynattrs.artifact_value()),
         "values": dynattrs.value(dict[str, str]),
@@ -135,6 +144,7 @@ def _cmake_configure_files_impl(ctx: AnalysisContext) -> list[Provider]:
     ctx.actions.dynamic_output_new(_configure(
         templates = {path: tree.project(src) for path, src in ctx.attrs.files.items()},
         values = ctx.attrs.values,
+        file_values = {name: tree.project(src) for name, src in ctx.attrs.file_values.items()},
         at_only = ctx.attrs.at_only,
         out = out.as_output(),
     ))
@@ -142,11 +152,13 @@ def _cmake_configure_files_impl(ctx: AnalysisContext) -> list[Provider]:
 
 # A directory of configured files: `files` maps each output path to its
 # template, a path inside `tree`. Outputs listed in `at_only` are expanded as
-# configure_file(... @ONLY) does.
+# configure_file(... @ONLY) does. `file_values` maps a variable to a file in
+# `tree` whose contents it holds (file(READ <file> <variable>)).
 cmake_configure_files = rule(
     impl = _cmake_configure_files_impl,
     attrs = {
         "at_only": attrs.list(attrs.string(), default = []),
+        "file_values": attrs.dict(attrs.string(), attrs.string(), default = {}),
         "files": attrs.dict(attrs.string(), attrs.string()),
         "labels": attrs.list(attrs.string(), default = []),
         "tree": attrs.dep(),
