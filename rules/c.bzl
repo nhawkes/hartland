@@ -314,3 +314,58 @@ sysroot_c_binary = rule(
         "_cc": attrs.default_only(attrs.toolchain_dep(default = "toolchains//:cc-freestanding", providers = [CcToolchainInfo])),
     },
 )
+
+def _clang_cc_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
+    clang = ctx.attrs.clang[RunInfo]
+    triple = ctx.attrs.triple
+    # <resource dir>: include/ (clang/lib/Headers) and, hosted, the
+    # per-target runtime directory (LLVM_ENABLE_PER_TARGET_RUNTIME_DIR, the
+    # Linux default) with compiler-rt's builtins and crt objects.
+    resource = {"include": ctx.attrs.resource_headers[DefaultInfo].default_outputs[0]}
+    flags = []
+    if ctx.attrs.sysroot:
+        rt = ctx.attrs.compiler_rt
+        lib = "lib/" + triple + "/"
+        resource[lib + "libclang_rt.builtins.a"] = rt["builtins"]
+        resource[lib + "clang_rt.crtbegin.o"] = rt["crtbegin"]
+        resource[lib + "clang_rt.crtend.o"] = rt["crtend"]
+        # lld picks its flavour from argv[0]: the driver runs it as ld.lld.
+        ld = ctx.actions.symlinked_dir("ld", {"ld.lld": ctx.attrs.lld[DefaultInfo].default_outputs[0]})
+        flags = [
+            cmd_args(ctx.attrs.sysroot[DefaultInfo].default_outputs[0], format = "--sysroot={}"),
+            cmd_args(ld.project("ld.lld"), format = "--ld-path={}"),
+            "-rtlib=compiler-rt",
+        ]
+    resource_dir = ctx.actions.symlinked_dir("resource", resource)
+    driver = cmd_args(clang, cmd_args(resource_dir, format = "-resource-dir={}"), flags)
+    return [
+        DefaultInfo(),
+        CcToolchainInfo(
+            cc = driver,
+            # Until the stage builds its own libc++, C++ is the C driver's
+            # (callers bring -nostdinc++ and the library).
+            cxx = cmd_args(driver, "--driver-mode=g++"),
+            ar = cmd_args(ctx.attrs.ar[RunInfo]),
+            env = {},
+        ),
+    ]
+
+# A toolchain of our own clang. The tools are exec deps, configured for the
+# execution platform, which carries no bootstrap stage: they are always the
+# previous stage's build, so selecting this toolchain for a stage does not
+# make clang depend on itself. With `sysroot` (and `compiler_rt`) it is
+# hosted: links use our musl, lld and compiler-rt; without, freestanding.
+clang_cc_toolchain = rule(
+    impl = _clang_cc_toolchain_impl,
+    attrs = {
+        "ar": attrs.exec_dep(providers = [RunInfo]),
+        "clang": attrs.exec_dep(providers = [RunInfo]),
+        # builtins, crtbegin, crtend -> artifacts (compiler-rt's outputs).
+        "compiler_rt": attrs.dict(attrs.string(), attrs.source(), default = {}),
+        "lld": attrs.exec_dep(providers = [RunInfo]),
+        "resource_headers": attrs.dep(),
+        "sysroot": attrs.option(attrs.dep(), default = None),
+        "triple": attrs.string(default = "x86_64-unknown-linux-musl"),
+    },
+    is_toolchain_rule = True,
+)
