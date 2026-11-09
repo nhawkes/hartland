@@ -64,5 +64,8 @@ in CI machines.
   unpacked tree, and a dynamic action applies musl's Makefile selection
   rules (written in Starlark in `pkg/musl/musl.bzl`) and declares one
   compile per source. That puts the selection inside the build graph rather
-  than in a generated BUCK file over the VFS. It has not yet been verified
-  against upstream with nm, abidiff or libc-test.
+  than in a generated BUCK file over the VFS. It is verified against
+  upstream's test suite, libc-test (`pkg/libc-test`, built the same way:
+  its Makefile's selection in Starlark, one action per compile, link and
+  test run), with a committed list of expected failures; static binaries
+  only, as there is no dynamic loader yet. Not yet with nm or abidiff.

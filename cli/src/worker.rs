@@ -82,6 +82,8 @@ enum Request {
     PutBlob { digest: Digest },
     /// Worker to coordinator; body is a signed envelope.
     Signed,
+    /// Worker to coordinator: every Directory under `root`, at once.
+    GetTree { root: Digest },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -102,6 +104,9 @@ enum Response {
     Batch,
     /// Body: the blob.
     Blob,
+    /// Body: the exact bytes of the tree's Directory blobs, each preceded
+    /// by its length (u32, big-endian).
+    Tree,
     Missing,
     Ok,
     Refused {
@@ -188,6 +193,31 @@ pub async fn bind(identity: &Identity, network: Network) -> Result<Endpoint, Pee
         ep.online().await;
     }
     Ok(ep)
+}
+
+/// The path a connection uses right now: direct UDP, or n0's relay.
+fn path(conn: &Connection) -> (&'static str, Option<Duration>) {
+    match conn.paths().iter().find(|p| p.is_selected()) {
+        Some(p) if p.is_ip() => ("direct", Some(p.rtt())),
+        Some(p) => ("relay", Some(p.rtt())),
+        None => ("none", None),
+    }
+}
+
+/// Waits up to `limit` for a direct path. Bulk transfers wait for it: the
+/// public relays rate-limit, and NAT traversal usually succeeds within a
+/// second.
+async fn await_direct(conn: &Connection, limit: Duration) -> &'static str {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if path(conn).0 == "direct" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (kind, rtt) = path(conn);
+    tracing::info!(path = kind, ?rtt, waited = ?started.elapsed(), "connection path");
+    kind
 }
 
 /// What both sides require of each other.
@@ -384,6 +414,17 @@ impl Pool {
                 match pool.admit(&conn, &key).await {
                     Ok(slots) => {
                         tracing::info!(worker = %key, slots, "worker joined");
+                        {
+                            // Record how the path settles: direct, or relayed.
+                            let conn = conn.clone();
+                            tokio::spawn(async move {
+                                for after in [Duration::from_secs(5), Duration::from_secs(60)] {
+                                    tokio::time::sleep(after).await;
+                                    let (kind, rtt) = path(&conn);
+                                    tracing::info!(worker = %key, path = kind, ?rtt, "worker path");
+                                }
+                            });
+                        }
                         pool.members.pin().insert(
                             key,
                             Arc::new(Member {
@@ -454,8 +495,49 @@ impl Pool {
     }
 
     /// Serves a member's requests: inputs, outputs, signed batches.
-    async fn serve_member(&self, conn: &Connection, key: &PublicKey) {
-        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+    /// Every Directory blob under `root` that we hold, in one reply (a
+    /// toolchain tree is thousands of directories). Raw bytes: digests are
+    /// of the bytes, and re-encoding need not reproduce them.
+    async fn tree(&self, root: Digest) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(d) = stack.pop() {
+            if !seen.insert(d.hash) {
+                continue;
+            }
+            let Some(blob) = self.store.get_blob(&d.hash).await else {
+                continue;
+            };
+            let Ok(dir) = re::Directory::decode(blob.data().clone()) else {
+                continue;
+            };
+            stack.extend(
+                dir.directories
+                    .iter()
+                    .filter_map(|n| Digest::try_from(n.digest.as_ref()).ok()),
+            );
+            let Ok(len) = u32::try_from(blob.data().len()) else {
+                continue;
+            };
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(blob.data());
+        }
+        out
+    }
+
+    /// Requests are served concurrently: a worker fetches thousands of input
+    /// files the first time it sees a toolchain, and one at a time that
+    /// costs a round trip each.
+    async fn serve_member(self: &Arc<Pool>, conn: &Connection, key: &PublicKey) {
+        while let Ok((send, recv)) = conn.accept_bi().await {
+            let (pool, key) = (self.clone(), *key);
+            tokio::spawn(async move { pool.serve_request(send, recv, &key).await });
+        }
+    }
+
+    async fn serve_request(&self, mut send: SendStream, mut recv: RecvStream, key: &PublicKey) {
+        {
             let result: Result<(), PeerError> = async {
                 let (req, body) = read_msg::<Request>(&mut recv).await?;
                 match req {
@@ -472,6 +554,10 @@ impl Pool {
                     Request::Signed => {
                         self.accept_batch(key, body).await;
                         write_msg(&mut send, &Response::Ok, &[]).await
+                    }
+                    Request::GetTree { root } => {
+                        let body = self.tree(root).await;
+                        write_msg(&mut send, &Response::Tree, &body).await
                     }
                     other => Err(PeerError::Protocol(format!("unexpected {other:?}"))),
                 }
@@ -553,6 +639,47 @@ impl Store for RemoteStore {
         None
     }
 
+    /// One request for every Directory in the tree, then every missing file,
+    /// 64 at a time: the executor then materialises from local disk.
+    async fn prefetch_tree(&self, root: &Digest) {
+        use futures::StreamExt as _;
+        let Ok((Response::Tree, mut body)) =
+            call(&self.conn, &Request::GetTree { root: *root }, &[]).await
+        else {
+            return;
+        };
+        let mut files = Vec::new();
+        while body.len() >= 4 {
+            let len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+            if body.len() < 4 + len {
+                break;
+            }
+            let raw = body.slice(4..4 + len);
+            body = body.slice(4 + len..);
+            let Ok(dir) = re::Directory::decode(raw.clone()) else {
+                break;
+            };
+            // Stored under the digest of these exact bytes: the executor asks
+            // for the digests the tree names, so anything else is unused.
+            let _ = self.local.put_blob(&Blob::new(raw)).await;
+            files.extend(
+                dir.files
+                    .iter()
+                    .filter_map(|f| Digest::try_from(f.digest.as_ref()).ok()),
+            );
+        }
+        let started = Instant::now();
+        let n = files.len();
+        futures::stream::iter(files)
+            .for_each_concurrent(64, |d| async move {
+                if !self.local.has_blob(&d.hash).await {
+                    let _ = self.get_blob(&d.hash).await;
+                }
+            })
+            .await;
+        tracing::info!(files = n, elapsed = ?started.elapsed(), "prefetched an input tree");
+    }
+
     async fn put_action_result(
         &self,
         action: ActionDigest,
@@ -632,6 +759,9 @@ pub async fn run_worker(
                 )));
             }
             tracing::info!(coordinator = %coordinator, run = %signer.run_id, "joined");
+            // Before taking work (and pulling thousands of input files),
+            // give NAT traversal a moment to find a direct path.
+            await_direct(&conn, Duration::from_secs(5)).await;
         }
         (Response::Refused { reason }, _) => return Err(PeerError::Refused(reason)),
         (other, _) => return Err(PeerError::Protocol(format!("unexpected {other:?}"))),

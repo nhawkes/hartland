@@ -1,6 +1,6 @@
 # Scale-out
 
-Status: design, with the connectivity spike done.
+Status: built (hartland CLI `proxy serve --worker-workflow`, `proxy worker`; builder roles in `build.yml`); being exercised in CI.
 
 ## Problem
 
@@ -59,11 +59,10 @@ It dispatched the worker run (`workflow_dispatch` with `GITHUB_TOKEN` and
 
 - **Coordinator:** the job running buck2 and the signing proxy. It hands
   each action to a free worker over iroh instead of running it itself.
-- **Workers:** jobs of the same pinned builder workflow, started by the
-  coordinator's workflow run. Each runs actions in its own sandbox (same
-  three-uid separation), signs its results with its own OIDC token, and
-  returns them. The coordinator verifies worker signatures before using a
-  result, exactly as for cached results.
+- **Workers:** runs of the same pinned builder workflow, dispatched by the
+  coordinator. Each runs actions in its own sandbox (the worker process
+  holds the credentials; actions run as the sandbox uid) and signs its
+  results with its certified key.
 - **Chain of keys:** each job holds one Ed25519 key, which is also its iroh
   endpoint key, certified once by an OIDC token (`aud =
   hartland-key:<key>`). The coordinator dispatches workers with its key;
@@ -82,6 +81,50 @@ It dispatched the worker run (`workflow_dispatch` with `GITHUB_TOKEN` and
   limit.
 - **Limits:** 20 concurrent jobs on the Free plan, 40 on Pro (queued beyond
   that); minutes are free for public repositories.
+
+## As built
+
+- **Roles:** `build.yml` takes `role` (coordinator by default, or worker),
+  the coordinator's key and run, and `max_workers`. hartland-packages'
+  `attested.yml` is both the push trigger (coordinator) and the dispatch
+  target (worker); a stub on its `main` registers it for
+  `workflow_dispatch`.
+- **Dispatch on demand:** every 5 s the coordinator compares actions
+  waiting for a slot with workers joined or starting:
+  `wanted = ceil(waiting / slots per worker)`, capped by `max_workers`, at
+  most two new dispatches per tick; a dispatch that has not joined within
+  5 minutes is forgotten.
+- **Workers start from the coordinator's binary:** the coordinator compiles
+  the CLI from source and requests a token with audience
+  `hartland-binary:sha256:<digest>`; binary and token go to the Actions
+  cache (untrusted transport) before the build starts. A worker runs it
+  only if `ci/verify-binary.py` (standard-library Python: RS256 against the
+  archived keys) accepts the token: builder workflow at this commit, hosted
+  runner, same repository, audience = the digest of these bytes. Otherwise
+  it compiles from source.
+- **Signing:** workers sign their own batches with their certified keys
+  (envelope kind `hartland-certified-key-v0`); the coordinator collects
+  them before every publish and files only results it holds whose bytes
+  the batch vouches for. It never signs a worker's result.
+- **Idle:** a worker leaves after 60 s without work, signing first; its
+  job limit is 90 minutes.
+- **Logs:** each worker run commits its log to
+  `attest-workers/<coordinator run>`.
+- **Breaking the cache on purpose:** bump `[hartland] cache_seed` in
+  `.buckconfig`; it is a platform property, so it changes every action
+  digest and nothing else.
+
+## Results
+
+- Run on builder 67714f5 (musl, 1,365 actions, cache seed bumped): 4
+  workers joined 15-40 s after dispatch and ran 580 actions, but phase 1
+  took 7 m 40 s against ~5 m alone. Workers pulled ~19k input files each
+  while still relayed, and n0's relay rate-limited the coordinator.
+- Run on builder 03b4d3c (libc-test, 1,122 new actions; musl cached): 4
+  workers joined 8-17 s after dispatch, all on direct paths (RTT 2-60 ms),
+  after waiting for a direct path before taking work. Coordinator 678
+  actions, workers 444; phase 1 in 1 m 54 s. All worker batches accepted;
+  fresh-proxy rebuild 100% (2,480/2,480).
 
 ## Open
 

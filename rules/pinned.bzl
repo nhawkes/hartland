@@ -30,7 +30,7 @@ def _basename(url):
 def _pinned_file_impl(ctx: AnalysisContext) -> list[Provider]:
     url = ctx.attrs.urls[0]
     out = ctx.actions.declare_output(ctx.attrs.out or _basename(url))
-    ctx.actions.download_file(out.as_output(), url, sha256 = ctx.attrs.sha256, is_executable = ctx.attrs.executable)
+    ctx.actions.download_file(out.as_output(), url, sha256 = ctx.attrs.sha256, is_executable = ctx.attrs.executable, size_bytes = ctx.attrs.size_bytes)
     providers = [DefaultInfo(default_output = out)]
     if ctx.attrs.executable:
         providers.append(RunInfo(args = [out]))
@@ -42,6 +42,9 @@ _pinned_file = rule(
         "executable": attrs.bool(default = False),
         "out": attrs.option(attrs.string(), default = None),
         "sha256": attrs.string(),
+        # With the size, buck2 skips its HEAD request before downloading:
+        # needed for servers that refuse HEAD (gitweb snapshots do).
+        "size_bytes": attrs.option(attrs.int(), default = None),
         "urls": attrs.list(attrs.string()),
     },
 )
@@ -82,7 +85,7 @@ rm -rf "$tmp"
 def _pinned_archive_impl(ctx: AnalysisContext) -> list[Provider]:
     url = ctx.attrs.urls[0]
     archive = ctx.actions.declare_output("archive", _basename(url))
-    ctx.actions.download_file(archive.as_output(), url, sha256 = ctx.attrs.sha256)
+    ctx.actions.download_file(archive.as_output(), url, sha256 = ctx.attrs.sha256, size_bytes = ctx.attrs.size_bytes)
     out = ctx.actions.declare_output(ctx.label.name, dir = True)
     prefix = ctx.attrs.strip_prefix + "/" if ctx.attrs.strip_prefix else ""
     sh_action(
@@ -111,6 +114,8 @@ _pinned_archive = rule(
         # archive: this only keeps unused parts of large trees off disk.
         "paths": attrs.list(attrs.string(), default = []),
         "sha256": attrs.string(),
+        # See _pinned_file.
+        "size_bytes": attrs.option(attrs.int(), default = None),
         "strip_prefix": attrs.option(attrs.string(), default = None),
         "urls": attrs.list(attrs.string()),
         "_sh": attrs.default_only(attrs.exec_dep(default = "toolchains//:sh", providers = [ShellInfo])),

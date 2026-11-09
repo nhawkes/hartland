@@ -332,6 +332,7 @@ impl Executor {
                 .prefix("staging-")
                 .tempdir_in(&root)?;
             let staged = staging.path().join("d");
+            self.store.prefetch_tree(&Digest::try_from(d)?).await;
             self.materialize(d, &staged).await?;
             tokio::fs::rename(&staged, &path).await?;
             tokio::task::spawn_blocking(move || staging.close())
