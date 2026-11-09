@@ -1,4 +1,4 @@
-"""Compiling C straight from an unpacked source tree with the seed zig.
+"""Compiling C straight from an unpacked source tree.
 
 Each source is compiled from a projection of the pinned source tree, so
 nothing is copied into the repository and the prelude's C++ machinery is not
@@ -11,6 +11,12 @@ Zig's bundled libc++ headers. C++ code is built against a `zig_libc`: a
 libc installation (our musl, kernel headers, crt objects) that zig is pointed
 at through a libc paths file in `ZIG_LIBC`, so zig neither uses its own
 bundled musl nor looks at the host. `tree_cxx_link` links against it.
+
+Rules do not name a compiler: they take a `CcToolchainInfo` from
+toolchains//:cc (hosted: compiles and links against our libc) or
+toolchains//:cc-freestanding (no libc: musl itself, crt objects), so the
+bootstrap stage decides which compiler builds what. The seed is
+`zig_cc_toolchain`.
 """
 
 TreeObjectsInfo = provider(fields = {
@@ -36,6 +42,42 @@ def zig_libc_env(libc: ZigLibcInfo) -> dict[str, typing.Any]:
     """The action environment that makes zig use `libc`."""
     return {"ZIG_LIBC": cmd_args(libc.file, hidden = [libc.root])}
 
+CcToolchainInfo = provider(fields = {
+    # The compiler driver for C and assembly sources (flags follow).
+    "cc": provider_field(cmd_args),
+    # The compiler driver for C++ sources and for links.
+    "cxx": provider_field(cmd_args),
+    # The archiver, run as <ar> rcs <archive> <objects>.
+    "ar": provider_field(cmd_args),
+    # Environment for every compile and link (zig: the libc it uses).
+    "env": provider_field(dict[str, typing.Any]),
+})
+
+def _zig_cc_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
+    zig = ctx.attrs.zig[RunInfo]
+    env = zig_libc_env(ctx.attrs.libc[ZigLibcInfo]) if ctx.attrs.libc else {}
+    return [
+        DefaultInfo(),
+        CcToolchainInfo(
+            cc = cmd_args(zig, "cc"),
+            cxx = cmd_args(zig, "c++"),
+            ar = cmd_args(zig, "ar"),
+            env = env,
+        ),
+    ]
+
+# The seed toolchain: zig cc / zig c++ / zig ar. With `libc`, compiles and
+# links use that libc installation (hosted); without, only what each action
+# passes itself (freestanding: -nostdinc and explicit include directories).
+zig_cc_toolchain = rule(
+    impl = _zig_cc_toolchain_impl,
+    attrs = {
+        "libc": attrs.option(attrs.dep(providers = [ZigLibcInfo]), default = None),
+        "zig": attrs.exec_dep(providers = [RunInfo]),
+    },
+    is_toolchain_rule = True,
+)
+
 def _parent(p):
     return p.rsplit("/", 1)[0] if "/" in p else ""
 
@@ -57,15 +99,14 @@ def tree_c_includes(tree: Artifact, gen: [Artifact, None], include_dirs: list[st
 
 def tree_c_compile(
         actions: AnalysisActions,
-        zig: typing.Any,
+        cc: CcToolchainInfo,
         tree: Artifact,
         src: str,
         flags: list[str],
         includes: list[cmd_args],
         hidden: list[Artifact],
         target: str,
-        input_dirs: list[str],
-        env: dict[str, typing.Any] = {}) -> Artifact:
+        input_dirs: list[str]) -> Artifact:
     """Compiles `src` (a path inside `tree`) to obj/<src stem>.o, as C++ for
     C++ extensions and C (or assembly) otherwise. `hidden` is
     the tree plus any generated header directory. With `input_dirs`, the
@@ -79,8 +120,7 @@ def tree_c_compile(
         hidden = [h for h in hidden if h != tree] + [tree.project(x) for x in dirs]
     actions.run(
         cmd_args(
-            zig,
-            "c++" if src.rsplit(".", 1)[-1] in _CXX_EXTS else "cc",
+            cc.cxx if src.rsplit(".", 1)[-1] in _CXX_EXTS else cc.cc,
             "-target",
             target,
             "-c",
@@ -91,31 +131,31 @@ def tree_c_compile(
             includes,
             hidden = hidden,
         ),
-        env = env,
+        env = cc.env,
         category = "cc",
         identifier = src,
     )
     return out
 
-def tree_c_archive(actions: AnalysisActions, zig: typing.Any, out: OutputArtifact, name: str, objects: dict[str, Artifact]):
+def tree_c_archive(actions: AnalysisActions, cc: CcToolchainInfo, out: OutputArtifact, name: str, objects: dict[str, Artifact]):
     """Archives `objects` into `out`, members in sorted name order."""
     argsfile = actions.write("{}.objects".format(name), [objects[k] for k in sorted(objects)])
     actions.run(
-        cmd_args(zig, "ar", "rcs", out, cmd_args(argsfile, format = "@{}"), hidden = objects.values()),
+        cmd_args(cc.ar, "rcs", out, cmd_args(argsfile, format = "@{}"), hidden = objects.values()),
         category = "ar",
     )
 
 def tree_cxx_link(
         actions: AnalysisActions,
-        zig: typing.Any,
+        cc: CcToolchainInfo,
         out: OutputArtifact,
         objects: list[Artifact],
         archives: list[Artifact],
-        libc: ZigLibcInfo,
         flags: list[str],
         target: str,
         whole_archives: list[Artifact] = []):
-    """Links a static C++ executable against `libc`, with Zig's libc++.
+    """Links a static C++ executable against the toolchain's libc and C++
+    library (the seed: Zig's libc++).
     `archives` must be in link order (dependents before dependencies);
     `whole_archives` are linked entirely, like objects (for code that only
     registers itself through static constructors).
@@ -125,8 +165,7 @@ def tree_cxx_link(
     argsfile = actions.write("link.args", objects + whole + archives)
     actions.run(
         cmd_args(
-            zig,
-            "c++",
+            cc.cxx,
             "-target",
             target,
             "-static",
@@ -136,7 +175,7 @@ def tree_cxx_link(
             out,
             hidden = objects + whole_archives + archives,
         ),
-        env = zig_libc_env(libc),
+        env = cc.env,
         category = "link",
     )
 
@@ -168,7 +207,7 @@ zig_libc = rule(
 )
 
 def _tree_c_impl(ctx: AnalysisContext) -> list[Provider]:
-    zig = ctx.attrs._zig[RunInfo]
+    cc = ctx.attrs._cc[CcToolchainInfo]
     tree = ctx.attrs.tree[DefaultInfo].default_outputs[0]
     gen = ctx.attrs.generated[DefaultInfo].default_outputs[0] if ctx.attrs.generated else None
     includes = tree_c_includes(tree, gen, ctx.attrs.include_dirs)
@@ -177,12 +216,12 @@ def _tree_c_impl(ctx: AnalysisContext) -> list[Provider]:
     objects = {}
     for src in ctx.attrs.srcs:
         flags = list(ctx.attrs.cflags) + list(ctx.attrs.src_flags.get(src, []))
-        objects[tree_c_obj_name(src)] = tree_c_compile(ctx.actions, zig, tree, src, flags, includes, hidden, ctx.attrs.target, ctx.attrs.input_dirs)
+        objects[tree_c_obj_name(src)] = tree_c_compile(ctx.actions, cc, tree, src, flags, includes, hidden, ctx.attrs.target, ctx.attrs.input_dirs)
 
     providers = [TreeObjectsInfo(objects = objects)]
     if ctx.attrs.archive:
         lib = ctx.actions.declare_output(ctx.attrs.archive)
-        tree_c_archive(ctx.actions, zig, lib.as_output(), ctx.attrs.archive, objects)
+        tree_c_archive(ctx.actions, cc, lib.as_output(), ctx.attrs.archive, objects)
         providers.append(DefaultInfo(default_output = lib, sub_targets = {
             k: [DefaultInfo(default_output = v)]
             for k, v in objects.items()
@@ -211,12 +250,12 @@ tree_c = rule(
         "srcs": attrs.list(attrs.string()),
         "target": attrs.string(default = "x86_64-linux-musl"),
         "tree": attrs.dep(),
-        "_zig": attrs.default_only(attrs.exec_dep(default = "toolchains//:zig", providers = [RunInfo])),
+        "_cc": attrs.default_only(attrs.toolchain_dep(default = "toolchains//:cc-freestanding", providers = [CcToolchainInfo])),
     },
 )
 
 def _sysroot_c_binary_impl(ctx: AnalysisContext) -> list[Provider]:
-    zig = ctx.attrs._zig[RunInfo]
+    cc = ctx.attrs._cc[CcToolchainInfo]
     sysroot = ctx.attrs.sysroot[DefaultInfo].default_outputs[0]
     target = ["-target", ctx.attrs.target]
     objects = []
@@ -224,8 +263,7 @@ def _sysroot_c_binary_impl(ctx: AnalysisContext) -> list[Provider]:
         obj = ctx.actions.declare_output("obj", src.short_path + ".o")
         ctx.actions.run(
             cmd_args(
-                zig,
-                "cc",
+                cc.cc,
                 target,
                 "-nostdinc",
                 cmd_args(sysroot.project("include"), format = "-isystem{}"),
@@ -244,8 +282,7 @@ def _sysroot_c_binary_impl(ctx: AnalysisContext) -> list[Provider]:
     lib = sysroot.project("lib")
     ctx.actions.run(
         cmd_args(
-            zig,
-            "cc",
+            cc.cc,
             target,
             "-static",
             "-nostdlib",
@@ -274,6 +311,6 @@ sysroot_c_binary = rule(
         "srcs": attrs.list(attrs.source()),
         "sysroot": attrs.dep(),
         "target": attrs.string(default = "x86_64-linux-musl"),
-        "_zig": attrs.default_only(attrs.exec_dep(default = "toolchains//:zig", providers = [RunInfo])),
+        "_cc": attrs.default_only(attrs.toolchain_dep(default = "toolchains//:cc-freestanding", providers = [CcToolchainInfo])),
     },
 )
