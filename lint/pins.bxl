@@ -13,7 +13,7 @@ Fails (non-zero exit) when any target:
     which pins network off in code rather than in attributes.
 """
 
-_DOWNLOAD_RULES = ["http_archive", "http_file", "remote_file", "_pinned_archive", "_pinned_file"]
+_DOWNLOAD_RULES = ["http_archive", "http_file", "remote_file", "_pinned_archive", "_pinned_file", "_pinned_git"]
 
 # Prelude rules that reach for host binaries, and the hermetic replacement.
 _BANNED_PRELUDE = {

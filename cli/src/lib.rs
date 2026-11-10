@@ -20,4 +20,5 @@ pub mod package;
 pub mod proxy;
 pub mod reapi;
 pub mod sandbox;
+pub mod sources;
 pub mod worker;

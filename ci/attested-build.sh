@@ -39,6 +39,21 @@ id hlbuild >/dev/null 2>&1 || sudo useradd --create-home --shell /usr/sbin/nolog
 work="$(mktemp -d)"
 python3 "$hl/ci/make-keyring.py" "$builder" "$BUILDER_SHA" "$hl/keys/builders.json" > "$work/keyring.json"
 
+# Sources pinned by git commit: fetched here, outside every action, with the
+# seed zig (built as the runner in a scratch copy), then served to buck2 on
+# localhost (hartland.sources) for both phases.
+sources_tree="$work/sources-tree"
+cp -a "$caller" "$sources_tree"
+zig_release="$(cd "$sources_tree" && "$buck2" uquery 'kind(pinned_archive, deps(toolchains//:zig, 1))' 2>/dev/null)"
+zig_dir="$(cd "$sources_tree" && "$buck2" build "$zig_release" --show-full-output 2>/dev/null | awk '{print $2}')"
+BUCK2="$buck2" HARTLAND="$hartland" "$hl/ci/fetch-sources.sh" "$sources_tree" "$work/sources" "$zig_dir/zig" \
+    2>&1 | tee -a "$out/summary.txt" >&2
+(cd "$sources_tree" && "$buck2" kill >/dev/null 2>&1) || true
+rm -rf "$sources_tree"
+mkdir -p "$work/sources"
+"$hartland" sources serve --dir "$work/sources" --listen 127.0.0.1:8981 >>"$out/sources.log" 2>&1 &
+sources_server=$!
+
 # First tier (Actions cache) and promotion: everything from the default
 # branch goes to the registry; elsewhere only first-tier results reused.
 registry_args=(--registry ghcr.io --read "$namespace" --keyring "$work/keyring.json" --jwks "$hl/keys/github-actions-jwks.json")
@@ -103,7 +118,7 @@ if [ "${MAX_WORKERS:-0}" -gt 0 ] && [ -n "${GITHUB_WORKFLOW_REF:-}" ]; then
     log "scale-out: up to $MAX_WORKERS workers of ${caller_workflow##*/} on $GITHUB_REF_NAME"
 fi
 serve "$work/store1" "$promote" --write "$namespace" "${scale_args[@]}"
-build first && log "first build succeeded" && resources && usage || { log "first build FAILED"; kill -TERM "$proxy"; wait "$proxy" || true; exit 1; }
+build first && log "first build succeeded" && resources && usage || { log "first build FAILED"; kill -TERM "$proxy" "$sources_server"; wait "$proxy" || true; exit 1; }
 
 # Package attestations: one signed statement per package (a target labelled
 # `release`: what a consumer installs, not every intermediate archive),
@@ -157,6 +172,7 @@ serve "$work/store2" none
 build second && log "second build succeeded" || log "second build FAILED"
 grep -E 'Cache hits|Commands' "$out/build-second.log" | sed 's/^.*\] //' | tee -a "$out/summary.txt" >&2 || true
 kill -TERM "$proxy"; wait "$proxy" || true
+kill -TERM "$sources_server"; wait "$sources_server" || true
 
 if [ -n "$promoter" ]; then
     if wait "$promoter"; then log "registry promotion done"; else log "registry promotion FAILED (queued again next run)"; fi
