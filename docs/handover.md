@@ -93,6 +93,12 @@ Toolchains (`rules/c.bzl`, `toolchains/BUCK` in hartland-packages):
   `pkg/libcxx`, shared `pkg/runtimes/runtimes.bzl`) with their smoke test
   (exceptions, threads, filesystem); llvm-tblgen built by our clang against
   our libc++, runs.
+- Stage 1 builds clang, lld, llvm-ar (2,407 actions): clang compiled by our
+  clang against our libc++.
+- **Fixed point** (`-m hartland//cfg:stage2 //pkg/clang:clang`, 4,066
+  actions): clang built by the stage-2 compiler is byte-identical to clang
+  built by the stage-1 compiler (sha256 68fe3d97...). Toolchain stage 2's
+  tools are `staged(..., stage = "stage1")` (`rules/stage.bzl`).
 
 ## In flight / next
 
@@ -103,8 +109,9 @@ Toolchains (`rules/c.bzl`, `toolchains/BUCK` in hartland-packages):
    When it passes: merge both branches into `claude/p0-hermeticity`.
 2. CI builds only stage 0 (`//examples/... //pkg/...`). Add stage 1
    (`-m hartland//cfg:stage1`) to the attested targets.
-3. Fixed point: build clang again with the stage-2 compiler and compare
-   (needs a `stage2` toolchain selecting the stage-1 clang build).
+3. Put the fixed-point comparison in the build (an action comparing the
+   stage-1 and stage-2 clang) once CI can hold three LLVM builds (runner
+   disk ~14 GB; outputs need not all materialise on the coordinator).
 4. Then Linux From Scratch-level packages, built in stage 1+.
 5. Smaller: sandbox `/bin/sh` from pinned busybox (unblocks 4 libc-test
    tests); nm/abidiff checks against upstream; libunwind/libc++abi keep
