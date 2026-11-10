@@ -102,15 +102,14 @@ Toolchains (`rules/c.bzl`, `toolchains/BUCK` in hartland-packages):
 
 ## In flight / next
 
-0. **libc-test is out of CI** (hartland-packages `attested.yml` lists every
-   package but it): repo.or.cz now answers automated downloads with an
-   anti-bot page. Needs a mirror of the pinned snapshot added to
-   `pkg/libc-test/BUCK`'s `urls` (sha256-pinned, so any host will do); a
-   public release asset was refused by the session's permission
-   classifier and needs the owner's approval. Then restore `//pkg/...`.
-   The CI coordinator's package step now attests only `release`-labelled
-   targets (builder 92a4605): materialising every LLVM output filled the
-   runner disk (run 42721241735).
+0. Git-pinned sources (`pinned_git`, `hartland sources fetch|serve`,
+   `ci/fetch-sources.sh`): fetched outside actions by the seed's
+   `zig fetch`, archived canonically (format v1, `cli/src/sources.rs`),
+   served on 127.0.0.1:8981. libc-test uses it (repo.or.cz blocks HTTP
+   snapshot downloads, not git). Caveat: Zig 0.17.1 drops the executable
+   bit from its cache and hash; the archive takes it from the temporary
+   checkout `zig fetch` leaves behind (a Zig bug we depend on). Revisit on
+   the next Zig, or verify the bit another way.
 1. Done (hartland-packages d4fa708, run of 10 Nov 08:33-09:16 UTC): CI
    builds stage 0, stage 1 and the fixed point (`//pkg/bootstrap`:
    `staged` stage-1 builds and `fixed-point`, which fails unless the
