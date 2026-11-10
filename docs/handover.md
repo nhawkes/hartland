@@ -102,6 +102,15 @@ Toolchains (`rules/c.bzl`, `toolchains/BUCK` in hartland-packages):
 
 ## In flight / next
 
+0. **libc-test is out of CI** (hartland-packages `attested.yml` lists every
+   package but it): repo.or.cz now answers automated downloads with an
+   anti-bot page. Needs a mirror of the pinned snapshot added to
+   `pkg/libc-test/BUCK`'s `urls` (sha256-pinned, so any host will do); a
+   public release asset was refused by the session's permission
+   classifier and needs the owner's approval. Then restore `//pkg/...`.
+   The CI coordinator's package step now attests only `release`-labelled
+   targets (builder 92a4605): materialising every LLVM output filled the
+   runner disk (run 42721241735).
 1. Branch `claude/llvm-wip` (hartland-packages) and `claude/cc-toolchain`
    (hartland) are ahead of `claude/p0-hermeticity` by the runtimes and the
    cc-cxx toolchain. A local stage-1 build of clang, lld and llvm-ar (LLVM
