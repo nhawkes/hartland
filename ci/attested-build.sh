@@ -14,6 +14,9 @@ set -euo pipefail
 hl="$(realpath "$1")"; caller="$(realpath "$2")"; targets="$3"; out="$4"
 mkdir -p "$out"; out="$(realpath "$out")"
 log() { echo "attest: $*" | tee -a "$out/summary.txt" >&2; }
+# Free disk and memory, logged at each phase: a hosted runner that runs out
+# of either loses contact with GitHub and leaves no job log.
+resources() { log "free: disk $(df -h --output=avail / | tail -1 | tr -d ' '), memory $(free -h | awk '/^Mem:/ {print $7}')"; }
 
 : "${ACTIONS_ID_TOKEN_REQUEST_URL:?needs id-token: write}"
 : "${REGISTRY_USER:?}" "${REGISTRY_PASSWORD:?}" "${BUILDER_SHA:?}" "${GITHUB_REPOSITORY_OWNER:?}"
@@ -88,6 +91,7 @@ CFG
 }
 
 log "phase 1: build, execute in the sandbox, sign, publish"
+resources
 # Scale-out in phase 1: workers are dispatched as runs of the calling
 # workflow only while actions wait for a slot.
 scale_args=()
@@ -97,16 +101,26 @@ if [ "${MAX_WORKERS:-0}" -gt 0 ] && [ -n "${GITHUB_WORKFLOW_REF:-}" ]; then
     log "scale-out: up to $MAX_WORKERS workers of ${caller_workflow##*/} on $GITHUB_REF_NAME"
 fi
 serve "$work/store1" "$promote" --write "$namespace" "${scale_args[@]}"
-build first && log "first build succeeded" || { log "first build FAILED"; kill -TERM "$proxy"; wait "$proxy" || true; exit 1; }
+build first && log "first build succeeded" && resources || { log "first build FAILED"; kill -TERM "$proxy"; wait "$proxy" || true; exit 1; }
 
-# Package attestations: one signed statement per target, binding its output
-# files to the source repository and commit (checked against the token's own
-# claims by verifiers).
+# Package attestations: one signed statement per package (a target labelled
+# `release`: what a consumer installs, not every intermediate archive),
+# binding its output files to the source repository and commit (checked
+# against the token's own claims by verifiers). Only those outputs are
+# materialised, and only the statements are published: the files themselves
+# are in the signed cache, by digest.
 log "package attestations"
+resources
 pkgs="$out/packages"; mkdir -p "$pkgs"
-sudo -u hlbuild env -i HOME=/home/hlbuild PATH=/usr/bin:/bin \
-    sh -c "cd /home/hlbuild/build-first && /home/hlbuild/buck2 build $targets --materializations=all --show-full-json-output" \
-    2>/dev/null > "$work/outputs.json" || log "could not list outputs"
+release="$(sudo -u hlbuild env -i HOME=/home/hlbuild PATH=/usr/bin:/bin \
+    sh -c "cd /home/hlbuild/build-first && /home/hlbuild/buck2 uquery \"attrfilter(labels, release, set($targets))\"" 2>/dev/null | tr '\n' ' ')"
+if [ -n "${release// }" ]; then
+    sudo -u hlbuild env -i HOME=/home/hlbuild PATH=/usr/bin:/bin \
+        sh -c "cd /home/hlbuild/build-first && /home/hlbuild/buck2 build $release --materializations=all --show-full-json-output" \
+        2>/dev/null > "$work/outputs.json" || log "could not list outputs"
+else
+    log "no release targets"; echo '{}' > "$work/outputs.json"
+fi
 python3 - "$work/outputs.json" > "$work/outputs.tsv" <<'PY'
 import json, sys
 for label, path in sorted(json.load(open(sys.argv[1])).items()):
@@ -117,10 +131,9 @@ while IFS=$'\t' read -r label path; do
     [ -n "$label" ] || continue
     if [ ! -f "$path" ]; then log "skip $label: output is not a single file"; continue; fi
     n=$((n + 1)); name="$(basename "$path")"; dir="$pkgs/$n"; mkdir -p "$dir"
-    cp "$path" "$dir/$name"
     printf '%s\n' "$label" > "$dir/target.txt"
     "$hartland" attest package --target "$label" --repository "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" \
-        --output "$name=$dir/$name" --out "$dir/attestation.json" 2>&1 | tee -a "$out/summary.txt" >&2
+        --output "$name=$path" --out "$dir/attestation.json" 2>&1 | tee -a "$out/summary.txt" >&2
 done < "$work/outputs.tsv"
 cp "$work/keyring.json" "$out/keyring.json"
 
@@ -137,6 +150,7 @@ if [ -n "${HARTLAND_L1:-}" ]; then
 fi
 
 log "phase 2: fresh proxy, empty store: everything must come from signed entries"
+resources
 serve "$work/store2" none
 build second && log "second build succeeded" || log "second build FAILED"
 grep -E 'Cache hits|Commands' "$out/build-second.log" | sed 's/^.*\] //' | tee -a "$out/summary.txt" >&2 || true
