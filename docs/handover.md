@@ -111,16 +111,12 @@ Toolchains (`rules/c.bzl`, `toolchains/BUCK` in hartland-packages):
    The CI coordinator's package step now attests only `release`-labelled
    targets (builder 92a4605): materialising every LLVM output filled the
    runner disk (run 42721241735).
-1. Branch `claude/llvm-wip` (hartland-packages) and `claude/cc-toolchain`
-   (hartland) are ahead of `claude/p0-hermeticity` by the runtimes and the
-   cc-cxx toolchain. A local stage-1 build of clang, lld and llvm-ar (LLVM
-   built by our own clang: the stage-2 compiler) was running at writing.
-   When it passes: merge both branches into `claude/p0-hermeticity`.
-2. CI builds only stage 0 (`//examples/... //pkg/...`). Add stage 1
-   (`-m hartland//cfg:stage1`) to the attested targets.
-3. Put the fixed-point comparison in the build (an action comparing the
-   stage-1 and stage-2 clang) once CI can hold three LLVM builds (runner
-   disk ~14 GB; outputs need not all materialise on the coordinator).
+1. Done (hartland-packages d4fa708, run of 10 Nov 08:33-09:16 UTC): CI
+   builds stage 0, stage 1 and the fixed point (`//pkg/bootstrap`:
+   `staged` stage-1 builds and `fixed-point`, which fails unless the
+   stage-2 clang equals the stage-1 clang). 21,117 actions, 9,731 run by 8
+   workers; fresh-proxy rebuild 100% (21,325). The runner frees its
+   preinstalled SDKs first (free disk 8.9 -> 25+ GB).
 4. Then Linux From Scratch-level packages, built in stage 1+.
 5. busybox 1.37.0 from source (`pkg/busybox`, merged 61099ca): Kconfig
    evaluated and Kbuild applied in Starlark, upstream's helper tools built
