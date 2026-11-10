@@ -36,7 +36,7 @@
 //! archive: if it changes, so does every pin. A deliberate change of format
 //! bumps [`FORMAT_VERSION`] and every `pinned_git` sha256 with it.
 //!
-//! # From Zig's fetch to the archive
+//! # Fetching: Zig first, then gix
 //!
 //! `zig fetch --debug-hash git+<url>#<commit>` (Zig 0.17.1) prints one line
 //! per file and symlink with the sha256 its package hash is built from,
@@ -47,6 +47,16 @@
 //! Zig keeps the package as a directory), after checking that it holds
 //! exactly the files and symlinks of Zig's listing, each with Zig's hash.
 //! Only the executable bit is taken from the checkout unchecked.
+//!
+//! Zig's TLS client cannot talk to every host (repo.or.cz fails its
+//! handshake), so when `zig fetch` fails or exceeds its time limit the
+//! commit is fetched in-process with gix (https on rustls; gix checks every
+//! object's hash) and checked out from git's tree objects, which are
+//! authoritative for the executable bit and symlinks. Zig's hash of the
+//! tree is then computed here ([`Tree::zig_hash`], checked against Zig's on
+//! every Zig fetch), or for a tree only Zig can hash (one with a
+//! `build.zig.zon`), by `zig fetch --debug-hash` of the canonical archive,
+//! offline. So both paths pin, and check, the same two hashes.
 //!
 //! A tree is refused if it has anything git cannot put in a tree: empty
 //! directories (a submodule, whose content is not in the tree, or not a
@@ -66,19 +76,40 @@ use std::str::FromStr;
 /// The archive format described in the module documentation.
 pub const FORMAT_VERSION: u32 = 1;
 
+/// How long the seed zig may take to hash an archive (CPU-bound).
+const ZIG_HASH_LIMIT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
     #[error("not a git repository URL {url:?}: {reason}")]
     Url { url: String, reason: &'static str },
     #[error("{path}: {reason}")]
     Tree { path: PathBuf, reason: &'static str },
-    #[error("zig fetch {url}#{commit} failed ({status}): {stderr}")]
+    #[error("zig fetch {target} failed ({status}): {stderr}")]
     ZigFailed {
-        url: GitUrl,
-        commit: GitSha,
+        target: String,
         status: std::process::ExitStatus,
         stderr: String,
     },
+    #[error("zig fetch {target} took longer than {limit:?}")]
+    ZigTimeout {
+        target: String,
+        limit: std::time::Duration,
+    },
+    #[error("Zig hashes the tree as {zig}, hartland as {ours}: Zig's algorithm changed?")]
+    ZigHashAlgorithm { zig: ZigHash, ours: ZigHash },
+    #[error("git: {0}")]
+    Git(#[from] gix::Error),
+    #[error(
+        "commit {commit} is not on {url} (asked for by id: {by_id}; then all branches and tags)"
+    )]
+    CommitAbsent {
+        url: String,
+        commit: GitSha,
+        by_id: String,
+    },
+    #[error("{path}: submodules are not supported")]
+    Submodule { path: String },
     #[error("unexpected output from zig fetch: {0:?}")]
     ZigOutput(String),
     #[error("zig fetch left no checkout to archive in {0}")]
@@ -318,6 +349,46 @@ impl Tree {
         }
     }
 
+    /// Zig's package hash of this tree, as Zig 0.17.1 computes it for a
+    /// package without a manifest: `N-V-` and the unpadded url-safe base64
+    /// of `ff ff 00 00`, the total size of the files (u32, little-endian;
+    /// symlinks not counted) and the first 25 bytes of the sha256 of the
+    /// concatenated entry hashes (see [`Tree::check`]: files as not
+    /// executable) in bytewise path order. None for a tree with a
+    /// `build.zig.zon` (its manifest names the package and can exclude
+    /// files) or over 4 GiB: only Zig can hash those.
+    pub fn zig_hash(&self) -> Result<Option<ZigHash>, SourceError> {
+        use base64::Engine as _;
+        let mut entries = Sha256Context::default();
+        let mut size: u64 = 0;
+        for (path, kind) in &self.members {
+            if path.0 == b"build.zig.zon" {
+                return Ok(None);
+            }
+            let mut h = Sha256Context::default();
+            h.update(&path.0);
+            match kind {
+                Kind::Dir => continue,
+                Kind::File { .. } => {
+                    let content = std::fs::read(self.root.join(path.as_path()))?;
+                    size += content.len() as u64;
+                    h.update(&[0, 0]);
+                    h.update(&content);
+                }
+                Kind::Symlink { target } => h.update(target),
+            }
+            entries.update(h.finish().as_bytes());
+        }
+        let Ok(size) = u32::try_from(size) else {
+            return Ok(None);
+        };
+        let mut plus = vec![0xff, 0xff, 0, 0];
+        plus.extend_from_slice(&size.to_le_bytes());
+        plus.extend_from_slice(&entries.finish().as_bytes()[..25]);
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(plus);
+        Ok(Some(format!("N-V-{encoded}").parse()?))
+    }
+
     /// Writes the canonical archive (see the module documentation).
     pub fn write_archive(&self, prefix: &str, out: impl Write) -> io::Result<()> {
         fn header(kind: tar::EntryType, mode: u32, size: u64) -> tar::Header {
@@ -406,36 +477,81 @@ impl FromStr for ZigListing {
     }
 }
 
-/// Runs `zig fetch` with `cache` as its global cache (fresh and empty) and
-/// returns its listing and the checkout it left.
-pub fn zig_fetch(
+/// Runs `zig fetch --debug-hash <target>` with `cache` as its global cache
+/// (fresh and empty) and parses its listing; kills it after `limit`.
+fn run_zig(
     zig: &Path,
     cache: &Path,
-    url: &GitUrl,
-    commit: GitSha,
-) -> Result<(ZigListing, PathBuf), SourceError> {
-    let out = std::process::Command::new(zig)
+    target: &OsStr,
+    limit: std::time::Duration,
+) -> Result<ZigListing, SourceError> {
+    use std::io::Read as _;
+    let shown = || target.to_string_lossy().into_owned();
+    let mut child = std::process::Command::new(zig)
         .arg("fetch")
         .arg("--debug-hash")
-        .arg(format!("git+{url}#{commit}"))
+        .arg(target)
         .env("ZIG_GLOBAL_CACHE_DIR", cache)
         .stdin(std::process::Stdio::null())
-        .output()?;
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if !out.status.success() {
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    // Drained while it runs: a large listing would fill the pipe.
+    let drain = |mut r: Box<dyn io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf).map(|_| buf)
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("piped")));
+    let stderr = drain(Box::new(child.stderr.take().expect("piped")));
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            return Err(SourceError::ZigTimeout {
+                target: shown(),
+                limit,
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let joined = |h: std::thread::JoinHandle<io::Result<Vec<u8>>>| {
+        h.join()
+            .map_err(|_| io::Error::other("reader thread panicked"))?
+    };
+    let (stdout, stderr) = (joined(stdout)?, joined(stderr)?);
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+    if !status.success() {
         return Err(SourceError::ZigFailed {
-            url: url.clone(),
-            commit,
-            status: out.status,
+            target: shown(),
+            status,
             stderr,
         });
     }
     if !stderr.is_empty() {
         tracing::debug!(%stderr, "zig fetch");
     }
-    let listing: ZigListing = String::from_utf8(out.stdout)
+    String::from_utf8(stdout)
         .map_err(|e| SourceError::ZigOutput(String::from_utf8_lossy(e.as_bytes()).into_owned()))?
-        .parse()?;
+        .parse()
+}
+
+/// Has the seed zig fetch `commit` and returns its listing and the
+/// checkout it left.
+pub fn zig_fetch(
+    zig: &Path,
+    cache: &Path,
+    url: &GitUrl,
+    commit: GitSha,
+    limit: std::time::Duration,
+) -> Result<(ZigListing, PathBuf), SourceError> {
+    let target = format!("git+{url}#{commit}");
+    let listing = run_zig(zig, cache, OsStr::new(&target), limit)?;
     let package = cache.join("p").join(listing.hash().to_string());
     if package.is_dir() {
         return Ok((listing, package));
@@ -450,6 +566,156 @@ pub fn zig_fetch(
         (Some(dir), true) if dir.is_dir() => Ok((listing, dir)),
         _ => Err(SourceError::ZigCheckout(tmp)),
     }
+}
+
+/// Zig's listing and hash of a local archive (offline): Zig strips the
+/// archive's single top-level directory, as it does for any tarball.
+pub fn zig_hash_archive(
+    zig: &Path,
+    cache: &Path,
+    archive: &Path,
+    limit: std::time::Duration,
+) -> Result<ZigListing, SourceError> {
+    run_zig(zig, cache, archive.as_os_str(), limit)
+}
+
+fn object_id(commit: GitSha) -> gix::ObjectId {
+    gix::ObjectId::from_bytes_or_panic(commit.bytes())
+}
+
+/// A scratch repository: bare, with no configuration from the host.
+pub fn scratch_repository(dir: &Path) -> Result<gix::Repository, SourceError> {
+    Ok(gix::ThreadSafeRepository::init_opts(
+        dir,
+        gix::create::Kind::Bare,
+        gix::create::Options::default(),
+        gix::open::Options::isolated()
+            .config_overrides(["user.name=hartland", "user.email=hartland@localhost"]),
+    )?
+    .to_thread_local())
+}
+
+/// Fetches `commit` from `url` into `repo` with gix. Asks for the commit
+/// itself, one deep; if the server refuses wants for unadvertised objects,
+/// fetches all its branches and tags instead. gix checks the hash of every
+/// object it receives.
+pub fn gix_fetch(repo: &gix::Repository, url: &str, commit: GitSha) -> Result<(), SourceError> {
+    let id = object_id(commit);
+    let by_id = match gix_fetch_refspecs(
+        repo,
+        url,
+        &[commit.to_string()],
+        gix::remote::fetch::Shallow::DepthAtRemote(std::num::NonZeroU32::MIN),
+    ) {
+        Ok(()) if repo.find_commit(id).is_ok() => return Ok(()),
+        Ok(()) => "the server sent no such commit".to_string(),
+        Err(e) => e.to_string(),
+    };
+    tracing::info!(%url, %commit, reason = %by_id, "fetching by id failed; fetching all branches and tags");
+    gix_fetch_refspecs(
+        repo,
+        url,
+        &[
+            "+refs/heads/*:refs/remotes/origin/*".to_string(),
+            "+refs/tags/*:refs/tags/*".to_string(),
+        ],
+        gix::remote::fetch::Shallow::NoChange,
+    )?;
+    match repo.find_commit(id) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(SourceError::CommitAbsent {
+            url: url.to_string(),
+            commit,
+            by_id,
+        }),
+    }
+}
+
+fn gix_fetch_refspecs(
+    repo: &gix::Repository,
+    url: &str,
+    refspecs: &[String],
+    shallow: gix::remote::fetch::Shallow,
+) -> Result<(), SourceError> {
+    crate::http::install_ring();
+    let remote = repo
+        .remote_at(url)?
+        .with_fetch_tags(gix::remote::fetch::Tags::None)
+        .with_refspecs(
+            refspecs.iter().map(String::as_str),
+            gix::remote::Direction::Fetch,
+        )?;
+    let outcome = remote
+        .connect(gix::remote::Direction::Fetch)?
+        .prepare_fetch(gix::progress::Discard, Default::default())?
+        .with_shallow(shallow)
+        .receive(
+            gix::progress::Discard,
+            &std::sync::atomic::AtomicBool::new(false),
+        )?;
+    tracing::debug!(status = ?outcome.status, "fetched");
+    Ok(())
+}
+
+/// Checks out `commit`'s tree into `dir` (which must not exist), from git's
+/// tree objects: file modes 0644 or 0755 by git's executable bit, symlinks
+/// as symlinks. Refuses submodules and paths that could leave `dir`.
+pub fn checkout(repo: &gix::Repository, commit: GitSha, dir: &Path) -> Result<(), SourceError> {
+    let tree = repo.find_commit(object_id(commit))?.tree_id()?.detach();
+    checkout_tree(repo, tree, dir)
+}
+
+/// [`checkout`] of a tree.
+pub fn checkout_tree(
+    repo: &gix::Repository,
+    tree: gix::ObjectId,
+    dir: &Path,
+) -> Result<(), SourceError> {
+    use gix::objs::tree::EntryKind;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::create_dir(dir)?;
+    let mut recorder = gix::traverse::tree::Recorder::default();
+    // Breadth first: a directory is recorded before its contents.
+    repo.find_tree(tree)?
+        .traverse()
+        .breadthfirst(&mut recorder)?;
+    for e in recorder.records {
+        let shown = || String::from_utf8_lossy(&e.filepath).into_owned();
+        let ordinary = e
+            .filepath
+            .split(|b| *b == b'/')
+            .all(|c| !c.is_empty() && c != b"." && c != b".." && !c.eq_ignore_ascii_case(b".git"));
+        if !ordinary {
+            return Err(SourceError::Tree {
+                path: shown().into(),
+                reason: "not an ordinary path in a git tree",
+            });
+        }
+        let path = dir.join(OsStr::from_bytes(&e.filepath));
+        let file = |mode: u32| -> Result<(), SourceError> {
+            let data = repo.find_blob(e.oid)?.take_data();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&path)?
+                .write_all(&data)?;
+            // Not left to the umask.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+            Ok(())
+        };
+        match e.mode.kind() {
+            EntryKind::Tree => std::fs::create_dir(&path)?,
+            EntryKind::Blob => file(0o644)?,
+            EntryKind::BlobExecutable => file(0o755)?,
+            EntryKind::Link => {
+                let target = repo.find_blob(e.oid)?.take_data();
+                std::os::unix::fs::symlink(OsStr::from_bytes(&target), &path)?;
+            }
+            EntryKind::Commit => return Err(SourceError::Submodule { path: shown() }),
+        }
+    }
+    Ok(())
 }
 
 /// Hashes what passes through.
@@ -469,12 +735,48 @@ impl<W: Write> Write for Hashing<W> {
     }
 }
 
+/// How a source reached the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    /// It was already there.
+    Store,
+    Zig,
+    Gix,
+    /// `--from-dir`: an already fetched tree.
+    Dir,
+}
+
+impl fmt::Display for Via {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Via::Store => "store",
+            Via::Zig => "zig",
+            Via::Gix => "gix",
+            Via::Dir => "dir",
+        })
+    }
+}
+
 /// What a fetch stored.
 #[derive(Debug)]
 pub struct Fetched {
     pub sha256: Sha256,
     /// None when archived from a directory, or already in the store.
     pub zig_hash: Option<ZigHash>,
+    pub via: Via,
+}
+
+/// Pins a fetch is checked against.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Pins<'a> {
+    pub sha256: Option<Sha256>,
+    pub zig_hash: Option<&'a ZigHash>,
+}
+
+/// An archive written to the store's directory, not yet under its name.
+struct Pending {
+    file: tempfile::NamedTempFile,
+    sha256: Sha256,
 }
 
 /// `<store>/git/<sha256>.tar`: canonical archives by their sha256.
@@ -496,21 +798,23 @@ impl Store {
         self.git_dir().join(format!("{sha256}.tar"))
     }
 
-    /// Archives `tree` into the store and returns its sha256. With `want`,
-    /// a different archive is an error and nothing is written. The file
-    /// appears atomically (a temporary file, renamed).
-    pub fn put(
+    /// Writes `tree`'s archive to a temporary file in the store. With
+    /// `want`, a different archive is an error (and the file is removed).
+    fn archive(
         &self,
         tree: &Tree,
         name: &RepoName,
         commit: GitSha,
         want: Option<Sha256>,
-    ) -> Result<Sha256, SourceError> {
+    ) -> Result<Pending, SourceError> {
         std::fs::create_dir_all(self.git_dir())?;
-        let tmp = tempfile::NamedTempFile::new_in(self.git_dir())?;
+        // `.tar`: Zig tells archives apart by their name.
+        let file = tempfile::Builder::new()
+            .suffix(".tar")
+            .tempfile_in(self.git_dir())?;
         let got = {
             let mut out = Hashing {
-                inner: io::BufWriter::new(tmp.as_file()),
+                inner: io::BufWriter::new(file.as_file()),
                 hash: Sha256Context::default(),
             };
             tree.write_archive(&archive_prefix(name, commit), &mut out)?;
@@ -523,57 +827,158 @@ impl Store {
         if let Some(want) = want.filter(|w| *w != got) {
             return Err(SourceError::Mismatch { commit, got, want });
         }
-        tmp.as_file()
+        file.as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o644))?;
-        tmp.persist(self.path(&got)).map_err(|e| e.error)?;
-        Ok(got)
+        Ok(Pending { file, sha256: got })
+    }
+
+    /// Puts a checked archive under its name, atomically.
+    fn persist(&self, pending: Pending) -> Result<Sha256, SourceError> {
+        pending
+            .file
+            .persist(self.path(&pending.sha256))
+            .map_err(|e| e.error)?;
+        Ok(pending.sha256)
+    }
+
+    /// Archives `tree` into the store and returns its sha256. With `want`,
+    /// a different archive is an error and nothing is written.
+    pub fn put(
+        &self,
+        tree: &Tree,
+        name: &RepoName,
+        commit: GitSha,
+        want: Option<Sha256>,
+    ) -> Result<Sha256, SourceError> {
+        let pending = self.archive(tree, name, commit, want)?;
+        self.persist(pending)
     }
 
     fn has(&self, want: Option<Sha256>) -> Option<Sha256> {
         want.filter(|w| self.path(w).is_file())
     }
 
-    /// Fetches `commit` with the seed `zig` and stores its archive. With
-    /// `want` already in the store, does nothing.
+    /// A scratch directory in the store (so on its filesystem), removed
+    /// when dropped.
+    fn scratch(&self, prefix: &str) -> io::Result<tempfile::TempDir> {
+        std::fs::create_dir_all(&self.root)?;
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(&self.root)
+    }
+
+    /// Fetches `commit` and stores its archive, checked against `pins`:
+    /// with the seed `zig` (given at most `limit`), else with gix. With the
+    /// pinned sha256 already in the store, does nothing.
     pub fn fetch(
         &self,
         zig: &Path,
+        limit: std::time::Duration,
         url: &GitUrl,
         commit: GitSha,
-        want: Option<Sha256>,
-        want_zig: Option<&ZigHash>,
+        pins: Pins<'_>,
     ) -> Result<Fetched, SourceError> {
-        if let Some(sha256) = self.has(want) {
+        if let Some(sha256) = self.has(pins.sha256) {
             tracing::info!(%url, %commit, %sha256, "already in the store");
             return Ok(Fetched {
                 sha256,
                 zig_hash: None,
+                via: Via::Store,
             });
         }
-        std::fs::create_dir_all(&self.root)?;
-        // In the store, so on its filesystem; removed when done.
-        let cache = tempfile::Builder::new()
-            .prefix("zig-cache-")
-            .tempdir_in(&self.root)?;
-        tracing::info!(%url, %commit, "zig fetch");
-        let (listing, checkout) = zig_fetch(zig, cache.path(), url, commit)?;
-        let got = listing.hash().clone();
-        tracing::info!(%url, %commit, zig_hash = %got, "fetched");
-        if let Some(want) = want_zig.filter(|w| **w != got) {
-            return Err(SourceError::ZigMismatch {
+        let cache = self.scratch("zig-cache-")?;
+        tracing::info!(%url, %commit, "fetching with zig");
+        let fetched = match zig_fetch(zig, cache.path(), url, commit, limit) {
+            Ok((listing, checkout)) => {
+                let tree = Tree::read(&checkout)?;
+                tree.check(&listing)?;
+                // Keeps the Rust implementation of Zig's hash honest.
+                if let Some(ours) = tree.zig_hash()?.filter(|h| h != listing.hash()) {
+                    return Err(SourceError::ZigHashAlgorithm {
+                        zig: listing.hash().clone(),
+                        ours,
+                    });
+                }
+                self.finish_zig(&tree, url, commit, listing, pins)?
+            }
+            Err(e) => {
+                tracing::warn!(%url, %commit, error = %e, "zig fetch failed; fetching with gix");
+                drop(cache);
+                self.fetch_gix(zig, url, commit, pins)?
+            }
+        };
+        tracing::info!(%url, %commit, sha256 = %fetched.sha256, via = %fetched.via, "stored");
+        Ok(fetched)
+    }
+
+    fn fetch_gix(
+        &self,
+        zig: &Path,
+        url: &GitUrl,
+        commit: GitSha,
+        pins: Pins<'_>,
+    ) -> Result<Fetched, SourceError> {
+        let scratch = self.scratch("gix-")?;
+        let repo = scratch_repository(&scratch.path().join("repo.git"))?;
+        gix_fetch(&repo, &url.to_string(), commit)?;
+        let dir = scratch.path().join("tree");
+        checkout(&repo, commit, &dir)?;
+        let tree = Tree::read(&dir)?;
+        let pending = self.archive(&tree, url.name(), commit, pins.sha256)?;
+        // Zig's hash of the same tree: computed here, or, where only Zig
+        // can, by the seed zig from the archive (offline, but slow: it
+        // recompresses the package).
+        let zig_hash = match tree.zig_hash()? {
+            Some(h) => h,
+            None => {
+                let cache = self.scratch("zig-cache-")?;
+                let listing =
+                    zig_hash_archive(zig, cache.path(), pending.file.path(), ZIG_HASH_LIMIT)?;
+                tree.check(&listing)?;
+                listing.hash().clone()
+            }
+        };
+        self.check_zig(url, commit, &zig_hash, pins)?;
+        Ok(Fetched {
+            sha256: self.persist(pending)?,
+            zig_hash: Some(zig_hash),
+            via: Via::Gix,
+        })
+    }
+
+    fn check_zig(
+        &self,
+        url: &GitUrl,
+        commit: GitSha,
+        got: &ZigHash,
+        pins: Pins<'_>,
+    ) -> Result<(), SourceError> {
+        tracing::info!(%url, %commit, zig_hash = %got, "zig hash");
+        match pins.zig_hash.filter(|w| *w != got) {
+            Some(want) => Err(SourceError::ZigMismatch {
                 url: url.clone(),
                 commit,
-                got,
+                got: got.clone(),
                 want: want.clone(),
-            });
+            }),
+            None => Ok(()),
         }
-        let tree = Tree::read(&checkout)?;
-        tree.check(&listing)?;
-        let sha256 = self.put(&tree, url.name(), commit, want)?;
-        tracing::info!(%url, %commit, %sha256, "stored");
+    }
+
+    fn finish_zig(
+        &self,
+        tree: &Tree,
+        url: &GitUrl,
+        commit: GitSha,
+        listing: ZigListing,
+        pins: Pins<'_>,
+    ) -> Result<Fetched, SourceError> {
+        self.check_zig(url, commit, listing.hash(), pins)?;
+        let pending = self.archive(tree, url.name(), commit, pins.sha256)?;
         Ok(Fetched {
-            sha256,
-            zig_hash: Some(got),
+            sha256: self.persist(pending)?,
+            zig_hash: Some(listing.hash().clone()),
+            via: Via::Zig,
         })
     }
 
@@ -585,14 +990,18 @@ impl Store {
         commit: GitSha,
         want: Option<Sha256>,
     ) -> Result<Fetched, SourceError> {
-        let sha256 = match self.has(want) {
-            Some(sha256) => sha256,
-            None => self.put(&Tree::read(dir)?, url.name(), commit, want)?,
+        let (sha256, via) = match self.has(want) {
+            Some(sha256) => (sha256, Via::Store),
+            None => (
+                self.put(&Tree::read(dir)?, url.name(), commit, want)?,
+                Via::Dir,
+            ),
         };
         tracing::info!(%url, %commit, %sha256, dir = %dir.display(), "stored");
         Ok(Fetched {
             sha256,
             zig_hash: None,
+            via,
         })
     }
 }
@@ -860,5 +1269,150 @@ N-V-__8AAA8AAABTzqy0ZMCn36mHMaTo8ISmsoNvvGZ_NZla
         assert!(s.to_string().parse::<ArchiveName>().is_err());
         assert!(format!("{s}.tar.gz").parse::<ArchiveName>().is_err());
         assert!("../x.tar".parse::<ArchiveName>().is_err());
+    }
+
+    #[test]
+    fn computes_zigs_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let tree = Tree::read(dir.path()).unwrap();
+        // What Zig 0.17.1 printed for this tree (LISTING).
+        assert_eq!(
+            tree.zig_hash().unwrap().unwrap(),
+            LISTING.parse::<ZigListing>().unwrap().hash().clone()
+        );
+        std::fs::write(dir.path().join("build.zig.zon"), ".{}").unwrap();
+        assert_eq!(Tree::read(dir.path()).unwrap().zig_hash().unwrap(), None);
+    }
+
+    fn entry(
+        kind: gix::objs::tree::EntryKind,
+        name: &str,
+        oid: gix::ObjectId,
+    ) -> gix::objs::tree::Entry {
+        gix::objs::tree::Entry {
+            mode: kind.into(),
+            filename: name.into(),
+            oid,
+        }
+    }
+
+    /// The fixture as git objects; returns its tree. Entries in git's
+    /// order (a directory sorts as `name/`).
+    fn fixture_objects(repo: &gix::Repository) -> gix::ObjectId {
+        use gix::objs::tree::EntryKind::{Blob, BlobExecutable, Link, Tree};
+        let blob = |data: &str| repo.write_blob(data).unwrap().detach();
+        let tree = |entries| {
+            repo.write_object(gix::objs::Tree { entries })
+                .unwrap()
+                .detach()
+        };
+        let e = tree(vec![entry(Blob, "f", blob("x\n"))]);
+        let d = tree(vec![
+            entry(Tree, "e", e),
+            entry(Link, "link", blob("../a.txt")),
+            entry(BlobExecutable, "run.sh", blob("#!/bin/sh\n")),
+        ]);
+        tree(vec![
+            entry(Blob, "a.txt", blob("hi\n")),
+            entry(Tree, "d", d),
+        ])
+    }
+
+    #[test]
+    fn checks_out_git_trees_with_modes_and_symlinks() {
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch_repository(&scratch.path().join("repo.git")).unwrap();
+        let root = fixture_objects(&repo);
+        let dir = scratch.path().join("tree");
+        // A umask that would drop the executable bit does not.
+        checkout_tree(&repo, root, &dir).unwrap();
+        assert_eq!(
+            Sha256::of(&archive(&dir)).to_string(),
+            "1095d3f78d352db796c0dc81030f69a547440cd912fe0e95e1dd975cb7a234fd"
+        );
+    }
+
+    #[test]
+    fn checkout_refuses_submodules_and_escapes() {
+        use gix::objs::tree::EntryKind::{Blob, Commit};
+        let scratch = tempfile::tempdir().unwrap();
+        let repo = scratch_repository(&scratch.path().join("repo.git")).unwrap();
+        let blob = repo.write_blob("x").unwrap().detach();
+        let commit: GitSha = COMMIT.parse().unwrap();
+        for (i, e) in [
+            entry(Commit, "sub", object_id(commit)),
+            entry(Blob, "..", blob),
+            entry(Blob, ".git", blob),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tree = repo
+                .write_object(gix::objs::Tree { entries: vec![e] })
+                .unwrap()
+                .detach();
+            let dir = scratch.path().join(format!("t{i}"));
+            assert!(checkout_tree(&repo, tree, &dir).is_err());
+        }
+    }
+
+    /// A real fetch, from a local repository: gix's file transport runs
+    /// `git upload-pack`, so this needs git (skipped without it).
+    #[test]
+    fn fetches_a_commit_with_gix() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("no git: skipped");
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let upstream = scratch_repository(&scratch.path().join("upstream.git")).unwrap();
+        let tree = fixture_objects(&upstream);
+        let who = gix::actor::Signature {
+            name: "t".into(),
+            email: "t@t".into(),
+            time: gix::date::Time::default(),
+        };
+        let id = upstream
+            .write_object(gix::objs::Commit {
+                tree,
+                parents: Default::default(),
+                author: who.clone(),
+                committer: who,
+                encoding: None,
+                message: "fixture\n".into(),
+                extra_headers: Vec::new(),
+            })
+            .unwrap()
+            .detach();
+        upstream
+            .reference(
+                "refs/heads/main",
+                id,
+                gix::refs::transaction::PreviousValue::Any,
+                "fixture",
+            )
+            .unwrap();
+        let commit: GitSha = id.to_string().parse().unwrap();
+        let repo = scratch_repository(&scratch.path().join("repo.git")).unwrap();
+        let url = format!("file://{}", scratch.path().join("upstream.git").display());
+        gix_fetch(&repo, &url, commit).unwrap();
+        let dir = scratch.path().join("tree");
+        checkout(&repo, commit, &dir).unwrap();
+        assert_eq!(
+            Sha256::of(&archive(&dir)).to_string(),
+            "1095d3f78d352db796c0dc81030f69a547440cd912fe0e95e1dd975cb7a234fd"
+        );
+        // An absent commit is an error, after both ways of asking.
+        let absent: GitSha = "1111111111111111111111111111111111111111".parse().unwrap();
+        let repo = scratch_repository(&scratch.path().join("repo2.git")).unwrap();
+        assert!(matches!(
+            gix_fetch(&repo, &url, absent),
+            Err(SourceError::CommitAbsent { .. })
+        ));
     }
 }

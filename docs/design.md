@@ -57,8 +57,9 @@ in CI machines.
 - **Sources** are tarballs or git commits. A project without release
   tarballs (or whose host blocks automated downloads) is pinned by commit
   with `pinned_git`. The commit is fetched outside every action, by
-  `hartland sources fetch` running the seed Zig's package manager
-  (`ci/fetch-sources.sh`), and served on localhost by `hartland sources
+  `hartland sources fetch` (`ci/fetch-sources.sh`): with the seed Zig's
+  package manager, or in-process with gix where Zig fails (its TLS client
+  cannot reach every host), and served on localhost by `hartland sources
   serve`, from which buck2's own downloader fetches it like any pinned
   file. The pin is the sha256 of the tree's canonical archive (an
   uncompressed ustar with fixed metadata; the format is specified and

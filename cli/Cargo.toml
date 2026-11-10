@@ -12,6 +12,7 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crossbeam-queue = "0.3.14"
 futures = "0.3.34"
+gix = { version = "0.90.0", default-features = false, features = ["blocking-http-transport-reqwest", "sha1"] }
 hex = "0.4.3"
 iroh = "1.4.1"
 monostate = "1.0.3"

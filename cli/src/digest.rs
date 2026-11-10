@@ -66,6 +66,10 @@ impl Sha256 {
         }
     }
 
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// The two-character shard for content-addressed directories.
     pub fn shard(&self) -> String {
         hex::encode(&self.0[..1])
@@ -140,6 +144,10 @@ impl fmt::Debug for Sha256 {
 pub struct GitSha([u8; 20]);
 
 impl GitSha {
+    pub fn bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
+
     /// The abbreviated form: the first seven hex digits.
     pub fn short(&self) -> String {
         let mut s = self.to_string();

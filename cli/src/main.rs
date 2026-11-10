@@ -54,7 +54,8 @@ enum Command {
 #[derive(Args)]
 #[group(required = true, multiple = false)]
 struct TreeSource {
-    /// The seed zig: `zig fetch` fetches the commit.
+    /// The seed zig: `zig fetch` fetches the commit (gix if it fails) and
+    /// hashes the tree.
     #[arg(long)]
     zig: Option<PathBuf>,
     /// An already fetched tree of the commit (no fetch, no Zig hash).
@@ -64,8 +65,9 @@ struct TreeSource {
 
 #[derive(Subcommand)]
 enum SourcesCommand {
-    /// Fetch a commit and store its canonical archive as
-    /// <dir>/git/<sha256>.tar; prints the sha256 and Zig's hash.
+    /// Fetch a commit (with the seed zig, else gix) and store its canonical
+    /// archive as <dir>/git/<sha256>.tar; prints the sha256, Zig's hash and
+    /// how it was fetched.
     Fetch {
         #[arg(long)]
         dir: PathBuf,
@@ -80,6 +82,9 @@ enum SourcesCommand {
         /// The pinned Zig package hash (with --zig).
         #[arg(long, requires = "zig", conflicts_with = "from_dir")]
         zig_hash: Option<ZigHash>,
+        /// Seconds `zig fetch` may take before gix fetches instead.
+        #[arg(long, default_value_t = 60, requires = "zig")]
+        zig_timeout: u64,
         #[command(flatten)]
         source: TreeSource,
     },
@@ -560,12 +565,18 @@ async fn sources(c: SourcesCommand) -> anyhow::Result<()> {
             commit,
             sha256,
             zig_hash,
+            zig_timeout,
             source,
         } => {
             let store = hartland::sources::Store::new(dir);
             let fetched = tokio::task::spawn_blocking(move || match source {
                 TreeSource { zig: Some(zig), .. } => {
-                    store.fetch(&zig, &url, commit, sha256, zig_hash.as_ref())
+                    let pins = hartland::sources::Pins {
+                        sha256,
+                        zig_hash: zig_hash.as_ref(),
+                    };
+                    let limit = std::time::Duration::from_secs(zig_timeout);
+                    store.fetch(&zig, limit, &url, commit, pins)
                 }
                 TreeSource {
                     from_dir: Some(tree),
@@ -574,10 +585,14 @@ async fn sources(c: SourcesCommand) -> anyhow::Result<()> {
                 TreeSource { .. } => unreachable!("clap requires one source"),
             })
             .await??;
-            match fetched.zig_hash {
-                Some(z) => println!("{} {z}", fetched.sha256),
-                None => println!("{}", fetched.sha256),
-            }
+            // `<sha256> <zig hash or -> <how>`
+            let zig_hash = fetched.zig_hash.map(|z| z.to_string());
+            println!(
+                "{} {} {}",
+                fetched.sha256,
+                zig_hash.as_deref().unwrap_or("-"),
+                fetched.via
+            );
             Ok(())
         }
         SourcesCommand::Serve { dir, listen } => {

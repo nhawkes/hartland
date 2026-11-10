@@ -3,7 +3,9 @@
 //! and the HTTP server buck2 downloads from. No network.
 
 use hartland::digest::{GitSha, Sha256};
-use hartland::sources::{GitUrl, SourceError, Store, ZigHash};
+use hartland::sources::{GitUrl, Pins, SourceError, Store, Via, ZigHash, zig_fetch};
+
+const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
@@ -106,14 +108,18 @@ fn zig_fetch_checks_and_archives_zigs_checkout() {
     let got = store
         .fetch(
             &zig,
+            LIMIT,
             &url(),
             commit(),
-            Some(SHA256.parse().unwrap()),
-            Some(&zig_hash),
+            Pins {
+                sha256: Some(SHA256.parse().unwrap()),
+                zig_hash: Some(&zig_hash),
+            },
         )
         .unwrap();
     assert_eq!(got.sha256.to_string(), SHA256);
     assert_eq!(got.zig_hash, Some(zig_hash));
+    assert_eq!(got.via, Via::Zig);
     // Zig's scratch cache is gone; only the archive is left.
     let names: Vec<String> = std::fs::read_dir(store_dir.path())
         .unwrap()
@@ -126,10 +132,13 @@ fn zig_fetch_checks_and_archives_zigs_checkout() {
     let err = Store::new(other_store.path().to_path_buf())
         .fetch(
             &zig,
+            LIMIT,
             &url(),
             commit(),
-            None,
-            Some(&"N-V-other".parse().unwrap()),
+            Pins {
+                sha256: None,
+                zig_hash: Some(&"N-V-other".parse().unwrap()),
+            },
         )
         .unwrap_err();
     assert!(matches!(err, SourceError::ZigMismatch { .. }), "{err}");
@@ -138,25 +147,47 @@ fn zig_fetch_checks_and_archives_zigs_checkout() {
     std::fs::write(tree.path().join("a.txt"), "tampered\n").unwrap();
     let other_store = tempfile::tempdir().unwrap();
     let err = Store::new(other_store.path().to_path_buf())
-        .fetch(&zig, &url(), commit(), None, None)
+        .fetch(&zig, LIMIT, &url(), commit(), Pins::default())
         .unwrap_err();
     assert!(matches!(err, SourceError::Listing { .. }), "{err}");
 }
 
+fn script(dir: &Path, body: &str) -> std::path::PathBuf {
+    let zig = dir.join("zig");
+    std::fs::write(&zig, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&zig, std::fs::Permissions::from_mode(0o755)).unwrap();
+    zig
+}
+
+// (Store::fetch falls back to gix when zig fails, which needs the network:
+// zig's failures are tested on zig_fetch itself.)
 #[test]
 fn a_failing_zig_is_an_error() {
-    let (bin, store_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let zig = bin.path().join("zig");
-    std::fs::write(
+    let (bin, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let zig = script(
+        bin.path(),
+        "echo 'error: TlsInitializationFailed' >&2\nexit 1",
+    );
+    let err = zig_fetch(&zig, cache.path(), &url(), commit(), LIMIT).unwrap_err();
+    assert!(matches!(err, SourceError::ZigFailed { .. }), "{err}");
+    assert!(err.to_string().contains("TlsInitializationFailed"), "{err}");
+}
+
+#[test]
+fn a_slow_zig_is_stopped() {
+    let (bin, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let zig = script(bin.path(), "exec sleep 30");
+    let started = std::time::Instant::now();
+    let err = zig_fetch(
         &zig,
-        "#!/bin/sh\necho 'error: unable to connect' >&2\nexit 1\n",
+        cache.path(),
+        &url(),
+        commit(),
+        std::time::Duration::from_millis(300),
     )
-    .unwrap();
-    std::fs::set_permissions(&zig, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let err = Store::new(store_dir.path().to_path_buf())
-        .fetch(&zig, &url(), commit(), None, None)
-        .unwrap_err();
-    assert!(err.to_string().contains("unable to connect"), "{err}");
+    .unwrap_err();
+    assert!(matches!(err, SourceError::ZigTimeout { .. }), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
 
 #[tokio::test]

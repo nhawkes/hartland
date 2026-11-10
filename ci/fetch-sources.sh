@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Fetches every pinned_git source of a project into a store for
-# `hartland sources serve`, with the seed zig. Fetching happens here, outside
-# any build action; buck2 then downloads each canonical archive by sha256.
+# `hartland sources serve`: with the seed zig, or with gix (in hartland) where
+# zig fails. Fetching happens here, outside any build action; buck2 then
+# downloads each canonical archive by sha256.
 #
 # Usage: fetch-sources.sh <repo root> <store> <zig>
 # Uses `buck2` and `hartland` from PATH unless BUCK2 / HARTLAND are set.
@@ -20,7 +21,8 @@ for label, a in sorted(json.load(sys.stdin).items()):
 while IFS=$'\t' read -r label url commit sha256 zig_hash; do
     args=(--dir "$store" --url "$url" --commit "$commit" --sha256 "$sha256" --zig "$zig")
     [ -n "$zig_hash" ] && args+=(--zig-hash "$zig_hash")
-    # Prints the sha256 and Zig's hash of the tree (for pinning zig_hash).
+    # Prints the sha256, Zig's hash of the tree (for pinning zig_hash) and
+    # how it was fetched (zig or gix).
     fetched="$("$hartland" sources fetch "${args[@]}")"
     echo "fetch-sources: $label $fetched" >&2
 done

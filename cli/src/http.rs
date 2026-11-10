@@ -3,7 +3,9 @@
 
 use std::sync::OnceLock;
 
-fn install_ring() {
+/// Installs ring as rustls's crypto provider (for every client in the
+/// process, gix's included).
+pub fn install_ring() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         // Fails only if a provider is already installed, which is fine.
