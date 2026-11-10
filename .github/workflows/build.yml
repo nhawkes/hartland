@@ -101,6 +101,14 @@ jobs:
           key: hartland-bin-${{ steps.self.outputs.sha }}-${{ github.run_id }}
       # First cache tier: signed batches and their blobs in GitHub's Actions
       # cache (untrusted transport: verified on load like everything else).
+      - name: Free disk (preinstalled SDKs no action uses)
+        shell: bash
+        # Hosted runners ship ~25 GB of SDKs (Android, .NET, GHC, CodeQL,
+        # Swift); actions run only graph-built tools and the seeds, so none
+        # of it is used. In the background: the build does not wait for it.
+        run: |
+          sudo nohup rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift >/dev/null 2>&1 &
       - name: Restore first-tier cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -173,6 +181,14 @@ jobs:
               nhawkes/hartland/.github/workflows/build.yml "${{ steps.self.outputs.sha }}" "$GITHUB_REPOSITORY"; then
             mkdir -p hl/cli/target/release && cp "$bin/hartland" hl/cli/target/release/hartland
           fi
+      - name: Free disk (preinstalled SDKs no action uses)
+        shell: bash
+        # Hosted runners ship ~25 GB of SDKs (Android, .NET, GHC, CodeQL,
+        # Swift); actions run only graph-built tools and the seeds, so none
+        # of it is used. In the background: the build does not wait for it.
+        run: |
+          sudo nohup rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift >/dev/null 2>&1 &
       - name: Work
         shell: bash
         run: bash hl/ci/attested-worker.sh hl 2>&1 | tee "$RUNNER_TEMP/worker.log"
