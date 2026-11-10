@@ -16,6 +16,8 @@ mkdir -p "$out"; out="$(realpath "$out")"
 log() { echo "attest: $*" | tee -a "$out/summary.txt" >&2; }
 # Free disk and memory, logged at each phase: a hosted runner that runs out
 # of either loses contact with GitHub and leaves no job log.
+# Where the disk went: the proxy stores, buck2's output, the first tier.
+usage() { log "disk use: $(sudo du -sh "$work"/* /home/hlbuild/build-first/buck-out ${HARTLAND_L1:+"$HARTLAND_L1"} 2>/dev/null | sed "s|$work/||" | tr '\t\n' ': ' )"; }
 resources() { log "free: disk $(df -h --output=avail / | tail -1 | tr -d ' '), memory $(free -h | awk '/^Mem:/ {print $7}')"; }
 
 : "${ACTIONS_ID_TOKEN_REQUEST_URL:?needs id-token: write}"
@@ -101,7 +103,7 @@ if [ "${MAX_WORKERS:-0}" -gt 0 ] && [ -n "${GITHUB_WORKFLOW_REF:-}" ]; then
     log "scale-out: up to $MAX_WORKERS workers of ${caller_workflow##*/} on $GITHUB_REF_NAME"
 fi
 serve "$work/store1" "$promote" --write "$namespace" "${scale_args[@]}"
-build first && log "first build succeeded" && resources || { log "first build FAILED"; kill -TERM "$proxy"; wait "$proxy" || true; exit 1; }
+build first && log "first build succeeded" && resources && usage || { log "first build FAILED"; kill -TERM "$proxy"; wait "$proxy" || true; exit 1; }
 
 # Package attestations: one signed statement per package (a target labelled
 # `release`: what a consumer installs, not every intermediate archive),
