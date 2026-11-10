@@ -54,6 +54,15 @@ in CI machines.
   builds: only results of actions it ran in its own sandbox can be signed.
 - **Signing** is settled: GitHub OIDC tokens, keyrings of trusted builder
   commits.
+- **Sources** are tarballs or git commits. A project without release
+  tarballs (or whose host blocks automated downloads) is pinned by commit
+  with `pinned_git`. The commit is fetched outside every action, by
+  `hartland sources fetch` running the seed Zig's package manager
+  (`ci/fetch-sources.sh`), and served on localhost by `hartland sources
+  serve`, from which buck2's own downloader fetches it like any pinned
+  file. The pin is the sha256 of the tree's canonical archive (an
+  uncompressed ustar with fixed metadata; the format is specified and
+  versioned in `cli/src/sources.rs`), next to Zig's own hash of the tree.
 
 ## Not yet following the design
 

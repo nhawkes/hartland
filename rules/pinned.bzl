@@ -1,6 +1,7 @@
 """Hash-pinned downloads: the only way external bytes enter a Hartland build.
 
-Every pin must carry a sha256. sha1-only pins and unpinned URLs are rejected at
+Every pin must carry a sha256: of a file, an archive, or a git commit's
+canonical archive (pinned_git). sha1-only pins and unpinned URLs are rejected at
 load time. Archives are unpacked with the pinned busybox, never the host's tar.
 """
 
@@ -82,10 +83,7 @@ done
 rm -rf "$tmp"
 """
 
-def _pinned_archive_impl(ctx: AnalysisContext) -> list[Provider]:
-    url = ctx.attrs.urls[0]
-    archive = ctx.actions.declare_output("archive", _basename(url))
-    ctx.actions.download_file(archive.as_output(), url, sha256 = ctx.attrs.sha256, size_bytes = ctx.attrs.size_bytes)
+def _unpack(ctx: AnalysisContext, archive: Artifact) -> list[Provider]:
     out = ctx.actions.declare_output(ctx.label.name, dir = True)
     prefix = ctx.attrs.strip_prefix + "/" if ctx.attrs.strip_prefix else ""
     sh_action(
@@ -104,21 +102,49 @@ def _pinned_archive_impl(ctx: AnalysisContext) -> list[Provider]:
     )
     return [DefaultInfo(default_output = out)]
 
+def _pinned_archive_impl(ctx: AnalysisContext) -> list[Provider]:
+    url = ctx.attrs.urls[0]
+    archive = ctx.actions.declare_output("archive", _basename(url))
+    ctx.actions.download_file(archive.as_output(), url, sha256 = ctx.attrs.sha256, size_bytes = ctx.attrs.size_bytes)
+    return _unpack(ctx, archive)
+
+_UNPACK_ATTRS = {
+    # tar only: glob patterns (relative to strip_prefix) left unpacked.
+    "excludes": attrs.list(attrs.string(), default = []),
+    # tar only: the members (relative to strip_prefix) to unpack; empty
+    # means the whole archive. The download is still the whole, pinned
+    # archive: this only keeps unused parts of large trees off disk.
+    "paths": attrs.list(attrs.string(), default = []),
+    "strip_prefix": attrs.option(attrs.string(), default = None),
+    "_sh": attrs.default_only(attrs.exec_dep(default = "toolchains//:sh", providers = [ShellInfo])),
+}
+
 _pinned_archive = rule(
     impl = _pinned_archive_impl,
-    attrs = {
-        # tar only: glob patterns (relative to strip_prefix) left unpacked.
-        "excludes": attrs.list(attrs.string(), default = []),
-        # tar only: the members (relative to strip_prefix) to unpack; empty
-        # means the whole archive. The download is still the whole, pinned
-        # archive: this only keeps unused parts of large trees off disk.
-        "paths": attrs.list(attrs.string(), default = []),
+    attrs = _UNPACK_ATTRS | {
         "sha256": attrs.string(),
         # See _pinned_file.
         "size_bytes": attrs.option(attrs.int(), default = None),
-        "strip_prefix": attrs.option(attrs.string(), default = None),
         "urls": attrs.list(attrs.string()),
-        "_sh": attrs.default_only(attrs.exec_dep(default = "toolchains//:sh", providers = [ShellInfo])),
+    },
+)
+
+def _pinned_git_impl(ctx: AnalysisContext) -> list[Provider]:
+    archive = ctx.actions.declare_output("archive", ctx.attrs.sha256 + ".tar")
+    ctx.actions.download_file(archive.as_output(), "{}/git/{}.tar".format(ctx.attrs.sources, ctx.attrs.sha256), sha256 = ctx.attrs.sha256)
+    return _unpack(ctx, archive)
+
+_pinned_git = rule(
+    impl = _pinned_git_impl,
+    attrs = _UNPACK_ATTRS | {
+        # Not read by the build: what `hartland sources fetch` fetches
+        # (ci/fetch-sources.sh queries them), and the source's provenance.
+        "commit": attrs.string(),
+        "sha256": attrs.string(),
+        # Where `hartland sources serve` listens (hartland.sources).
+        "sources": attrs.string(),
+        "url": attrs.string(),
+        "zig_hash": attrs.option(attrs.string(), default = None),
     },
 )
 
@@ -131,3 +157,29 @@ def pinned_file(name, urls, sha256, mirrors = [], **kwargs):
     """Download a single file, verified by sha256."""
     _check(name, urls, sha256, mirrors, kwargs)
     _pinned_file(name = name, urls = mirrors + urls, sha256 = sha256, **kwargs)
+
+def pinned_git(name, url, commit, sha256, zig_hash = None, **kwargs):
+    """Unpack a git commit's tree, verified by sha256.
+
+    The pin is the sha256 of the commit's canonical archive (an uncompressed
+    tar; its format is defined in hartland's cli/src/sources.rs). Fetching
+    happens outside the build: `hartland sources fetch` fetches the commit
+    with the seed zig's package manager (zig_hash pins Zig's own hash of the
+    tree) into a store that `hartland sources serve` offers at
+    hartland.sources (default http://127.0.0.1:8981), from which buck2
+    downloads `<sha256>.tar` like any pinned file.
+    """
+    _check(name, [url], sha256, [], kwargs)
+    if not url.startswith("https://"):
+        fail("{}: url must be https".format(name))
+    if len(commit) != 40 or [c for c in commit.elems() if c not in _HEX]:
+        fail("{}: commit must be a full, lowercase hex commit id".format(name))
+    _pinned_git(
+        name = name,
+        url = url,
+        commit = commit,
+        sha256 = sha256,
+        zig_hash = zig_hash,
+        sources = read_config("hartland", "sources", "http://127.0.0.1:8981"),
+        **kwargs
+    )

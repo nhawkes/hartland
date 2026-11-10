@@ -14,6 +14,7 @@ use hartland::proxy::{DiskStore, Proxy, Store};
 use hartland::reapi::re;
 use hartland::reapi::re::content_addressable_storage_client::ContentAddressableStorageClient;
 use hartland::sandbox::RelPath;
+use hartland::sources::{GitUrl, ZigHash};
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -44,6 +45,51 @@ enum Command {
     /// The Remote Execution API proxy and its test clients.
     #[command(subcommand)]
     Proxy(ProxyCommand),
+    /// Sources pinned by git commit: fetch them, serve them to buck2.
+    #[command(subcommand)]
+    Sources(SourcesCommand),
+}
+
+/// Where a git source's tree comes from.
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct TreeSource {
+    /// The seed zig: `zig fetch` fetches the commit.
+    #[arg(long)]
+    zig: Option<PathBuf>,
+    /// An already fetched tree of the commit (no fetch, no Zig hash).
+    #[arg(long)]
+    from_dir: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum SourcesCommand {
+    /// Fetch a commit and store its canonical archive as
+    /// <dir>/git/<sha256>.tar; prints the sha256 and Zig's hash.
+    Fetch {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        url: GitUrl,
+        #[arg(long)]
+        commit: GitSha,
+        /// The pinned archive sha256: anything else is an error. Nothing
+        /// is fetched if the store has it.
+        #[arg(long)]
+        sha256: Option<Sha256>,
+        /// The pinned Zig package hash (with --zig).
+        #[arg(long, requires = "zig", conflicts_with = "from_dir")]
+        zig_hash: Option<ZigHash>,
+        #[command(flatten)]
+        source: TreeSource,
+    },
+    /// Serve GET and HEAD /git/<sha256>.tar from the store.
+    Serve {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8981")]
+        listen: SocketAddr,
+    },
 }
 
 #[derive(Args)]
@@ -341,6 +387,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             argv,
         }) => sandbox_run(&input, &collect, &outputs, env, !no_drop_user, &argv).await,
         Command::Proxy(c) => proxy(c).await,
+        Command::Sources(c) => sources(c).await,
     }
 }
 
@@ -501,6 +548,42 @@ async fn sandbox_run(
         outcome.exit_code
     );
     Ok(())
+}
+
+// ---- sources --------------------------------------------------------------
+
+async fn sources(c: SourcesCommand) -> anyhow::Result<()> {
+    match c {
+        SourcesCommand::Fetch {
+            dir,
+            url,
+            commit,
+            sha256,
+            zig_hash,
+            source,
+        } => {
+            let store = hartland::sources::Store::new(dir);
+            let fetched = tokio::task::spawn_blocking(move || match source {
+                TreeSource { zig: Some(zig), .. } => {
+                    store.fetch(&zig, &url, commit, sha256, zig_hash.as_ref())
+                }
+                TreeSource {
+                    from_dir: Some(tree),
+                    ..
+                } => store.from_dir(&tree, &url, commit, sha256),
+                TreeSource { .. } => unreachable!("clap requires one source"),
+            })
+            .await??;
+            match fetched.zig_hash {
+                Some(z) => println!("{} {z}", fetched.sha256),
+                None => println!("{}", fetched.sha256),
+            }
+            Ok(())
+        }
+        SourcesCommand::Serve { dir, listen } => {
+            Ok(hartland::sources::serve_at(hartland::sources::Store::new(dir), listen).await?)
+        }
+    }
 }
 
 // ---- proxy ----------------------------------------------------------------

@@ -72,6 +72,31 @@ impl Sha256 {
     }
 }
 
+/// A sha256 computed incrementally.
+pub struct Sha256Context(ring::digest::Context);
+
+impl Default for Sha256Context {
+    fn default() -> Sha256Context {
+        Sha256Context(ring::digest::Context::new(&ring::digest::SHA256))
+    }
+}
+
+impl Sha256Context {
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    pub fn finish(self) -> Sha256 {
+        Sha256(
+            self.0
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("sha256 is 32 bytes"),
+        )
+    }
+}
+
 const fn hex_literal(s: &[u8; 64]) -> [u8; 32] {
     const fn nibble(c: u8) -> u8 {
         match c {
@@ -113,6 +138,15 @@ impl fmt::Debug for Sha256 {
     Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, SerializeDisplay, DeserializeFromStr,
 )]
 pub struct GitSha([u8; 20]);
+
+impl GitSha {
+    /// The abbreviated form: the first seven hex digits.
+    pub fn short(&self) -> String {
+        let mut s = self.to_string();
+        s.truncate(7);
+        s
+    }
+}
 
 impl FromStr for GitSha {
     type Err = ParseError;
