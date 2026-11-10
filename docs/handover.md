@@ -122,7 +122,18 @@ Toolchains (`rules/c.bzl`, `toolchains/BUCK` in hartland-packages):
    stage-1 and stage-2 clang) once CI can hold three LLVM builds (runner
    disk ~14 GB; outputs need not all materialise on the coordinator).
 4. Then Linux From Scratch-level packages, built in stage 1+.
-5. Smaller: sandbox `/bin/sh` from pinned busybox (unblocks 4 libc-test
+5. busybox 1.37.0 from source (`pkg/busybox`, merged 61099ca): Kconfig
+   evaluated and Kbuild applied in Starlark, upstream's helper tools built
+   and run in the graph; generated headers and the 575-object set match a
+   reference `make` build; upstream testsuite 954 pass / 27 fail (25 also
+   fail against glibc; 2 musl behaviour), not yet enforced. Next: make it
+   toolchains//:sh in place of the TOFU seed (a later stage, since the
+   seed builds it).
+6. Local (unsandboxed) builds inherit the daemon's environment beyond PATH
+   (e.g. SHELL); attested builds do not (bwrap --clearenv). Fixing it in
+   `sh_run` changes every shell action digest: fold it into the next change
+   that rebuilds everything anyway.
+7. Smaller: sandbox `/bin/sh` from pinned busybox (unblocks 4 libc-test
    tests); nm/abidiff checks against upstream; libunwind/libc++abi keep
    upstream's assertions (`-D_DEBUG`), embedding buck-out paths; pinned
    static bwrap; GHCR index write races; `hartland verify` for consumers.
